@@ -11,7 +11,11 @@
     <h1>Audit Results</h1>
 
     <div style="white-space: pre-wrap; border: 1px solid #ccc; padding: 20px; border-radius: 10px; background-color: #f3f4f6;">
-      {{ result|safe }}
+      {% if output %}
+        {{ output | safe }}
+      {% else %}
+        ⚠️ No audit output was generated. This may be due to a scanned or image-based PDF.
+      {% endif %}
     </div>
 
     <p style="margin-top: 30px;">
