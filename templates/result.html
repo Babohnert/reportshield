@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Audit Results – Report Shield</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <main class="container" role="main">
+    <h1>Audit Results</h1>
+
+    <div style="white-space: pre-wrap; border: 1px solid #ccc; padding: 20px; border-radius: 10px; background-color: #f3f4f6;">
+      {{ result|safe }}
+    </div>
+
+    <p style="margin-top: 30px;">
+      <a href="/">← Upload Another Report</a>
+    </p>
+
+    <footer>© 2025 Report Shield. All rights reserved.</footer>
+  </main>
+</body>
+</html>

@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Legal Notice & Disclaimer - Report Shield</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <main class="container" role="main" aria-labelledby="page-title">
+    <h1 id="page-title">Legal Notice & Disclaimer</h1>
+
+    <nav aria-label="Table of Contents">
+      <ol>
+        <li><a href="#definitions">1. Definitions</a></li>
+        <li><a href="#use-limitations">2. Use and Limitations</a></li>
+        <li><a href="#disclaimer">3. Disclaimer of Warranty</a></li>
+        <li><a href="#liability">4. Limitation of Liability</a></li>
+        <li><a href="#indemnification">5. Indemnification</a></li>
+        <li><a href="#privacy">6. Privacy</a></li>
+        <li><a href="#governing-law">7. Governing Law</a></li>
+        <li><a href="#updates">8. Updates to Notice</a></li>
+        <li><a href="#contact">9. Contact</a></li>
+      </ol>
+    </nav>
+
+    <section id="definitions">
+      <h2>1. Definitions</h2>
+      <p><strong>"Report Shield"</strong> refers to this software audit tool and its developers or authorized operators.</p>
+      <p><strong>"User"</strong> means any individual or organization using the tool.</p>
+      <p><strong>"Audit Results"</strong> refer to any content output by Report Shield following document analysis.</p>
+    </section>
+
+    <section id="use-limitations">
+      <h2>2. Use and Limitations</h2>
+      <p>This tool is provided as an internal-use-only supplement for appraisal report review. It is <em>not</em> a licensed valuation or compliance product.</p>
+      <p>Users are responsible for ensuring that all regulatory, legal, and client obligations are independently verified before relying on Audit Results.</p>
+    </section>
+
+    <section id="disclaimer">
+      <h2>3. Disclaimer of Warranty</h2>
+      <p>Report Shield is provided “as is,” without warranty of any kind. This includes but is not limited to warranties of:</p>
+      <ul>
+        <li>Merchantability</li>
+        <li>Fitness for a particular purpose</li>
+        <li>Non-infringement</li>
+        <li>Accuracy or fitness of audit results for decision-making</li>
+      </ul>
+    </section>
+
+    <section id="liability">
+      <h2>4. Limitation of Liability</h2>
+      <p>Under no circumstances shall Report Shield or its owners be liable for any direct or indirect damages, including:</p>
+      <ul>
+        <li>Loss of revenue, contracts, or professional licensure</li>
+        <li>Inaccuracies in appraisal content or system output</li>
+        <li>Misuse or misinterpretation of automated analysis</li>
+      </ul>
+    </section>
+
+    <section id="indemnification">
+      <h2>5. Indemnification</h2>
+      <p>You agree to indemnify and hold harmless Report Shield and its owners against any legal claims or liabilities arising from misuse of this tool.</p>
+    </section>
+
+    <section id="privacy">
+      <h2>6. Privacy</h2>
+      <p>Report Shield processes files locally and does not transmit data externally. Files are not stored, scanned, or retained once processed. Users remain responsible for data privacy compliance under local, state, and federal law.</p>
+    </section>
+
+    <section id="governing-law">
+      <h2>7. Governing Law</h2>
+      <p>This notice shall be governed by the laws of the State of Indiana, United States. Venue shall lie exclusively in state or federal courts located therein.</p>
+    </section>
+
+    <section id="updates">
+      <h2>8. Updates to Notice</h2>
+      <p>We may revise this Legal Notice without notice. Continued use of Report Shield after revisions indicates acceptance.</p>
+    </section>
+
+    <section id="contact">
+      <h2>9. Contact</h2>
+      <p>For legal or technical questions, contact <a href="mailto:finaleyes.ai@gmail.com">finaleyes.ai@gmail.com</a>.</p>
+    </section>
+
+    <a href="/" class="back-link" aria-label="Back to upload page">← Back to Upload</a>
+
+    <footer>© 2025 Report Shield. All rights reserved.</footer>
+  </main>
+</body>
+</html>
