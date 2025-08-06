@@ -2,7 +2,7 @@ from flask import Flask, render_template, request, send_file, redirect, url_for
 from waitress import serve
 import os
 import secrets
-from review_engine import run_full_audit  # ✅ UPDATED function name
+from review_engine import run_compliance_audit  # updated import
 
 app = Flask(__name__)
 UPLOAD_FOLDER = 'uploads'
@@ -19,7 +19,7 @@ def index():
             filepath = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
             file.save(filepath)
 
-            audit_output, flags = run_full_audit(filepath, file.filename)  # ✅ Dual return
+            audit_output = run_compliance_audit(filepath)  # single return
             return render_template('result.html', filename=file.filename, output=audit_output)
         else:
             return "Invalid file format. Only PDF files are supported."
