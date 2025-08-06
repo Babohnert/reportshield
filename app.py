@@ -1,39 +1,49 @@
-from flask import Flask, render_template, request, send_file
+from flask import Flask, render_template, request, send_file, redirect, url_for, flash
 from waitress import serve
 import os
 import secrets
+import time
 from werkzeug.utils import secure_filename
-from review_engine import run_compliance_audit  # correct function name
+from review_engine import run_compliance_audit
 
 app = Flask(__name__)
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.secret_key = secrets.token_hex(16)  # required for flashing messages
 
 ACCESS_KEY = os.getenv("REPORTSHIELD_KEY", secrets.token_hex(8))
+
+# Optional: Auto-delete old files (>1hr) to keep upload folder clean
+def cleanup_uploads(folder, age_limit=3600):
+    now = time.time()
+    for fname in os.listdir(folder):
+        fpath = os.path.join(folder, fname)
+        if os.path.isfile(fpath) and now - os.path.getmtime(fpath) > age_limit:
+            os.remove(fpath)
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
     if request.method == 'POST':
-        file = request.files['file']
+        file = request.files.get('file')
         if file and file.filename.endswith('.pdf'):
             filename = secure_filename(file.filename)
             filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
             file.save(filepath)
 
+            # Optional: cleanup old files
+            cleanup_uploads(app.config['UPLOAD_FOLDER'])
+
             audit_output = run_compliance_audit(filepath)
             return render_template('result.html', filename=filename, output=audit_output)
         else:
-            return "Invalid file format. Only PDF files are supported."
+            flash("❌ Invalid file format. Please upload a valid PDF file.")
+            return redirect(url_for('index'))
     return render_template('index.html')
 
 @app.route('/legal')
 def legal():
-    key = request.args.get("key")
-    app.logger.debug(f"Legal page access key: {key}")
-    if key != ACCESS_KEY:
-        return "Access denied. Append ?key=ACCESS_KEY to the URL."
-    return render_template('legal.html')
+    return render_template('legal.html')  # Made public
 
 @app.route('/uploads/<filename>')
 def download_file(filename):
