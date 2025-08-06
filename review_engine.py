@@ -7,7 +7,8 @@ from datetime import datetime
 def extract_text_from_pdf(file_path):
     try:
         with fitz.open(file_path) as doc:
-            return "\n".join(page.get_text() for page in doc)
+            text = "\n".join(page.get_text() for page in doc)
+            return text if text.strip() else "[Error: No text found in PDF. This may be a scanned document.]"
     except Exception as e:
         return f"[Error extracting text: {str(e)}]"
 
@@ -81,7 +82,7 @@ def run_compliance_audit(file_path):
     flags.extend(check_va_flags(raw_text))
     flags.extend(check_market_flags(raw_text))
 
-    # [SECTION 3] SECTION REVIEW (lightweight placeholder)
+    # [SECTION 3] SECTION REVIEW (basic placeholder)
     section_notes = [
         "→ Subject Info appears present with no obvious conflicts.",
         "→ Zoning information not parsed — recommend manual review.",
