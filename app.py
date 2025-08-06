@@ -3,7 +3,7 @@ from waitress import serve
 import os
 import secrets
 from werkzeug.utils import secure_filename
-from review_engine import run_compliance_audit  # updated import
+from review_engine import run_compliance_audit  # correct function name
 
 app = Flask(__name__)
 UPLOAD_FOLDER = 'uploads'
@@ -17,11 +17,11 @@ def index():
     if request.method == 'POST':
         file = request.files['file']
         if file and file.filename.endswith('.pdf'):
-            filename = secure_filename(file.filename)  # sanitize filename
+            filename = secure_filename(file.filename)
             filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
             file.save(filepath)
 
-            audit_output = run_compliance_audit(filepath)  # single return
+            audit_output = run_compliance_audit(filepath)
             return render_template('result.html', filename=filename, output=audit_output)
         else:
             return "Invalid file format. Only PDF files are supported."
@@ -37,7 +37,7 @@ def legal():
 
 @app.route('/uploads/<filename>')
 def download_file(filename):
-    filename = secure_filename(filename)  # sanitize filename
+    filename = secure_filename(filename)
     return send_file(os.path.join(app.config['UPLOAD_FOLDER'], filename), as_attachment=True)
 
 if __name__ == '__main__':
