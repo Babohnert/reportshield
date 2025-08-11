@@ -13,17 +13,28 @@ from azure.core.credentials import AzureKeyCredential
 # PDF parsing (PyMuPDF)
 import fitz  # PyMuPDF
 
+
 # ----------------------------
 # Environment / Clients
 # ----------------------------
-AZURE_ENDPOINT = os.getenv("AZURE_FORMRECOGNIZER_ENDPOINT")
-AZURE_KEY = os.getenv("AZURE_FORMRECOGNIZER_KEY")
+def _clean_env(v: Optional[str]) -> str:
+    """Trim quotes/whitespace; avoid bad URLs like \"https://...\" that break requests."""
+    if not v:
+        return ""
+    return v.strip().strip('"').strip("'")
+
+AZURE_ENDPOINT = _clean_env(os.getenv("AZURE_FORMRECOGNIZER_ENDPOINT"))
+AZURE_KEY = _clean_env(os.getenv("AZURE_FORMRECOGNIZER_KEY"))
 
 if not AZURE_ENDPOINT or not AZURE_KEY:
     raise RuntimeError(
         "Azure Form Recognizer endpoint/key not set. "
         "Add AZURE_FORMRECOGNIZER_ENDPOINT and AZURE_FORMRECOGNIZER_KEY to your .env"
     )
+
+# Be forgiving about a trailing slash — azure sdk copes either way, but keep tidy.
+if AZURE_ENDPOINT.endswith("/"):
+    AZURE_ENDPOINT = AZURE_ENDPOINT[:-1]
 
 doc_client = DocumentAnalysisClient(
     endpoint=AZURE_ENDPOINT,
@@ -33,6 +44,7 @@ doc_client = DocumentAnalysisClient(
 SYSTEM_DIR = os.path.join(os.path.dirname(__file__), "..", "system")
 OUTPUT_STYLE = os.getenv("OUTPUT_STYLE", "analyst").lower()  # "analyst" (default) or "v27"
 ENGINE_VERSION = "1.3"
+
 
 # ============================
 # Utility helpers
@@ -144,6 +156,7 @@ def find_evidence(pages: List[str], patterns: List[str]) -> str:
                 return f"p.{i}: {snip}"
     return ""
 
+
 # ============================
 # Azure extraction w/ PDF guard + autoslim
 # ============================
@@ -169,16 +182,31 @@ def extract_text_with_azure(file_obj) -> Tuple[str, bytes]:
         except Exception:
             data = raw  # continue with original bytes
 
-    # Call Azure and map common error messages to clearer text
+    # Call Azure and map common error messages to clearer text.
+    # If Azure fails for any reason, fall back to PyMuPDF so Wix/Render still returns a result.
     try:
         poller = doc_client.begin_analyze_document("prebuilt-document", data)
         result = poller.result()
     except Exception as ex:
         msg = str(ex)
+        # Provide helpful messages for common issues, but do NOT fail the whole request.
         if "InvalidContentLength" in msg or "image is too large" in msg:
-            raise RuntimeError("Azure rejected the file size. Try a smaller/compressed PDF.")
-        if "InvalidRequest" in msg:
-            raise RuntimeError("Azure returned InvalidRequest. Verify the file is a valid, readable PDF.")
+            hint = "Azure rejected the file size. Trying local text extraction…"
+        elif "InvalidRequest" in msg:
+            hint = "Azure returned InvalidRequest. Trying local text extraction…"
+        elif "No connection adapters were found" in msg or "ConnectionError" in msg:
+            hint = "Azure endpoint/key may be misconfigured. Trying local text extraction…"
+        else:
+            hint = "Azure analysis failed. Trying local text extraction…"
+
+        # Local fallback
+        text = extract_text_with_pymupdf(raw)
+        if text:
+            # Include a short note up top so you know this was a fallback path.
+            text = f"[Note] {hint}\n\n{text}"
+            return _normalize_text(text), raw
+
+        # If even fallback fails, surface the original error.
         raise RuntimeError(f"Azure analysis failed: {msg}")
 
     # Concatenate content in logical reading order
@@ -200,6 +228,7 @@ def extract_text_with_azure(file_obj) -> Tuple[str, bytes]:
             text = fallback
 
     return text, raw
+
 
 # ============================
 # Parsing helpers + data extraction
@@ -381,6 +410,7 @@ def extract_metadata(text: str) -> Dict[str, str]:
 
     return md
 
+
 # --- Additional pulls from UAD grid / comps ---
 def parse_subject_basics(text: str) -> Dict[str, str]:
     out = {"subject_gla": "", "subject_address": ""}
@@ -501,6 +531,7 @@ def find_adjustments(text: str, comp_no: int, label: str) -> str:
             return f"{m_amt.group(1)}{m_amt.group(2)}"
     return ""
 
+
 # ----------------------------
 # Rule checks (v27 uses it; analyst view uses richer sectioning)
 # ----------------------------
@@ -524,6 +555,7 @@ def check_flags(text: str, md: Dict[str, str]) -> List[str]:
 
 def summarize_top_flags(flags: List[str], k: int = 3) -> List[str]:
     return flags[:k]
+
 
 # ----------------------------
 # Evidence helpers (page pins)
@@ -555,6 +587,7 @@ def gather_core_evidence(pages: List[str], md: Dict[str, str]) -> Dict[str, str]
         ])
     return out
 
+
 # ----------------------------
 # Output composers
 # ----------------------------
@@ -577,7 +610,7 @@ def compose_output_v27(md: Dict[str, str], flags: List[str]) -> str:
     else:
         lines.append("→ No material compliance flags detected by automated checks.")
     lines.append("")
-    lines.append("[SECTION 3] DETAILED FLAGS AND REFERENCES")
+    lines.append("[SECTION 3] DETAILED FLAGS AND REFERENCES]")
     if flags:
         for f in flags:
             lines.append(f"→ {f}")
@@ -789,6 +822,7 @@ def compose_output_analyst(md: Dict[str, str], text: str, pages: List[str], req_
     lines.append("")
     lines.append(f"— Engine v{ENGINE_VERSION} • req:{req_id}")
     return "\n".join(lines)
+
 
 # ----------------------------
 # Public entry
