@@ -1,8 +1,7 @@
 import io
 import os
 import re
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -33,10 +32,10 @@ doc_client = DocumentAnalysisClient(
 
 SYSTEM_DIR = os.path.join(os.path.dirname(__file__), "..", "system")
 OUTPUT_STYLE = os.getenv("OUTPUT_STYLE", "analyst").lower()  # "analyst" (default) or "v27"
-ENGINE_VERSION = "1.3"
+ENGINE_VERSION = "1.4"
 
-# Toggle for evidence verbosity
-SHOW_VERBOSE_EVIDENCE = False  # False → only "p.N"; True → "p.N: <snippet>"
+# Toggle to show "(Evidence: …)" snippets throughout
+SHOW_VERBOSE_EVIDENCE = True
 
 # ============================
 # Utility helpers
@@ -83,9 +82,6 @@ def _clean_sentence(s: str) -> str:
         s = ""
     if len(s) > 240:
         s = s[:240].rstrip()
-    # tidy dangling " the."
-    if re.search(r"\s+the\.?$", s):
-        s = re.sub(r"\s+the\.?$", ".", s).strip()
     # end with period if it looks like a clause and not already ended
     if s and not s.endswith(".") and re.search(r"[a-zA-Z]\w", s):
         s += "."
@@ -97,15 +93,6 @@ def _normalize_address(a: str) -> str:
     a = re.sub(r"[^\w\s]", "", a)
     a = re.sub(r"\s+", " ", a).strip()
     return a
-
-def _fmt_date(s: str) -> str:
-    """Normalize various date forms to MM/DD/YYYY when possible."""
-    for fmt in ("%m/%d/%Y", "%m/%d/%y", "%B %d, %Y", "%b %d, %Y"):
-        try:
-            return datetime.strptime(s, fmt).strftime("%m/%d/%Y")
-        except Exception:
-            pass
-    return s
 
 def _read_as_bytes(file_obj) -> bytes:
     if hasattr(file_obj, "read"):
@@ -143,30 +130,30 @@ def extract_pages_text(raw: bytes) -> List[str]:
         pass
     return pages
 
-def _page_hit_str(i: int, page: str, m: re.Match) -> str:
-    if not SHOW_VERBOSE_EVIDENCE:
-        return f"p.{i}"
-    start = max(0, m.start() - 80)
-    end = min(len(page), m.end() + 80)
-    snip = page[start:end]
-    snip = re.sub(r"\s+", " ", snip).strip()
-    if len(snip) > 120:
-        snip = snip[:118] + "…"
-    return f"p.{i}: {snip}"
-
-def find_evidence_pageonly(pages: List[str], patterns: List[str]) -> str:
+def find_evidence(pages: List[str], patterns: List[str]) -> str:
     """
-    Search page texts for any of the patterns; return 'p.X' (or 'p.X: <snippet>' if SHOW_VERBOSE_EVIDENCE=True).
+    Search page texts for any of the patterns; return 'p.X: <snippet...>'.
     """
     for i, page in enumerate(pages, start=1):
         for pat in patterns:
             m = re.search(pat, page, re.IGNORECASE | re.DOTALL)
             if m:
-                return _page_hit_str(i, page, m)
+                start = max(0, m.start() - 80)
+                end = min(len(page), m.end() + 80)
+                snip = page[start:end]
+                snip = re.sub(r"\s+", " ", snip).strip()
+                if len(snip) > 160:
+                    snip = snip[:158] + "…"
+                return f"p.{i}: {snip}"
     return ""
 
+def _with_evidence(line: str, ev: str) -> str:
+    if SHOW_VERBOSE_EVIDENCE and ev:
+        return f"{line}  (Evidence: {ev})"
+    return line
+
 # ============================
-# Azure extraction w/ PDF guard + autoslim
+# Azure extraction w/ PDF guard + autoslim + HARD FALLBACK
 # ============================
 def extract_text_with_azure(file_obj) -> Tuple[str, bytes]:
     raw = _read_as_bytes(file_obj)
@@ -190,37 +177,42 @@ def extract_text_with_azure(file_obj) -> Tuple[str, bytes]:
         except Exception:
             data = raw  # continue with original bytes
 
-    # Call Azure and map common error messages to clearer text
     try:
+        # ---- Primary path: Azure DI ----
         poller = doc_client.begin_analyze_document("prebuilt-document", data)
         result = poller.result()
+
+        parts = []
+        if getattr(result, "content", None):
+            parts.append(result.content)
+        if not parts:
+            for page in getattr(result, "pages", []) or []:
+                for line in getattr(page, "lines", []) or []:
+                    parts.append(line.content)
+
+        text = _normalize_text("\n".join([p for p in parts if p]))
+
+        # If Azure text is sparse (grid-heavy PDFs), try PyMuPDF and pick the richer result
+        if len(text) < 800 or ("GLA" not in text and "Comparable" not in text and "COMPARABLE" not in text):
+            fallback = extract_text_with_pymupdf(raw)
+            if len(fallback) > len(text):
+                text = fallback
+
+        return text, raw
+
     except Exception as ex:
-        msg = str(ex)
-        if "InvalidContentLength" in msg or "image is too large" in msg:
-            raise RuntimeError("Azure rejected the file size. Try a smaller/compressed PDF.")
-        if "InvalidRequest" in msg:
-            raise RuntimeError("Azure returned InvalidRequest. Verify the file is a valid, readable PDF.")
-        raise RuntimeError(f"Azure analysis failed: {msg}")
-
-    # Concatenate content in logical reading order
-    parts = []
-    if getattr(result, "content", None):
-        parts.append(result.content)
-
-    if not parts:
-        for page in getattr(result, "pages", []) or []:
-            for line in getattr(page, "lines", []) or []:
-                parts.append(line.content)
-
-    text = _normalize_text("\n".join([p for p in parts if p]))
-
-    # If Azure text is sparse (grid-heavy PDFs), try PyMuPDF and pick the richer result
-    if len(text) < 800 or ("GLA" not in text and "Comparable" not in text and "COMPARABLE" not in text):
+        # ---- Hard fallback: never fail the whole request just because Azure flaked ----
+        # Common message seen: "No connection adapters were found for 'https://...prebuilt-document:analyze...'"
+        try:
+            print(f"[WARN] Azure analysis failed; falling back to local extraction: {ex}")
+        except Exception:
+            pass
         fallback = extract_text_with_pymupdf(raw)
-        if len(fallback) > len(text):
-            text = fallback
-
-    return text, raw
+        if fallback:
+            return _normalize_text(fallback), raw
+        # If even local extraction fails, surface a clean error
+        raise RuntimeError("Azure analysis failed and local text extraction also failed. "
+                           "Try a different or smaller PDF.")
 
 # ============================
 # Parsing helpers + data extraction
@@ -250,27 +242,28 @@ def _extract_client_lender(text: str) -> str:
             return cand if cand and cand.lower() != "case" else ""
     return ""
 
-def _extract_borrower(text: str) -> str:
-    m = re.search(r"\b(Borrower|Borrowers?)\s*[:=\-]\s*([A-Z][\w'&.,\- ]{2,80})", text, re.IGNORECASE)
-    return (m.group(2).strip(" .,")) if m else ""
-
 def _extract_rights_appraised(text: str) -> str:
     """
-    Prefer checkbox-marked options; fallback to single keyword match.
+    Choose a single rights selection, preferring a checked option near the Rights Appraised label.
     """
     block = ""
-    bm = re.search(r"(Property\s+Rights\s+Appraised.*?)(?:\n\n|$)", text, re.IGNORECASE | re.DOTALL)
-    if bm:
-        block = bm.group(1)
-        def picked(opt: str) -> bool:
-            return bool(re.search(rf"(☒|☑|✔|■|●|◉|X)\s*{opt}|{opt}\s*(☒|☑|✔|■|●|◉|X)", block, re.IGNORECASE))
-        if picked("Fee\s*Simple"):
-            return "Fee Simple"
-        if picked("Leasehold"):
-            return "Leasehold"
-    # fallback simple
-    m = re.search(r"\b(Fee\s+Simple|Leasehold)\b", text, re.IGNORECASE)
-    return m.group(1).title() if m else ""
+    m = re.search(r"(Rights\s+Appraised|Property\s+Rights\s+Appraised)[^\n]{0,160}", text, re.IGNORECASE)
+    if m:
+        block = m.group(0)
+
+    def picked(opt: str) -> bool:
+        return bool(re.search(rf"(☒|☑|✔|■|●|◉|X)\s*{opt}|{opt}\s*(☒|☑|✔|■|●|◉|X)", block, re.IGNORECASE))
+
+    if picked("Fee Simple"):
+        return "Fee Simple"
+    if picked("Leasehold"):
+        return "Leasehold"
+
+    # Fallback to text heuristics
+    m2 = re.search(r"\b(Fee\s+Simple|Leasehold)\b", block or text, re.IGNORECASE)
+    if m2:
+        return m2.group(1).title()
+    return ""
 
 def _extract_intended_use(text: str) -> str:
     m = re.search(r"\bINTENDED\s+USE\s*:\s*([^\n]{2,240})", text, re.IGNORECASE)
@@ -287,8 +280,12 @@ def _extract_intended_use(text: str) -> str:
 def _extract_va_case(text: str) -> str:
     """
     Pull VA case and normalize to 26-26-X-XXXXXXX (where X is alnum; middle char typically a letter).
+    Accept a variety of messy inputs.
     """
-    cands = re.findall(r"(?:VA\s*(?:Case|Loan)\s*(?:No\.?|Number)?:?\s*)?([26][\s-]?26[\s-]?[A-Za-z0-9][\s-]?[A-Za-z0-9]{7})", text, re.IGNORECASE)
+    cands = re.findall(
+        r"(?:VA\s*(?:Case|Loan)\s*(?:No\.?|Number)?:?\s*)?([26][\s-]?26[\s-]?[A-Za-z0-9][\s-]?[A-Za-z0-9]{7})",
+        text, re.IGNORECASE
+    )
     for c in cands:
         digits = re.sub(r"[^A-Za-z0-9]", "", c)
         if len(digits) >= 12 and digits[:2] == "26" and digits[2:4] == "26":
@@ -305,7 +302,6 @@ def extract_metadata(text: str) -> Dict[str, str]:
         "form_type": "",
         "appraiser_name": "",
         "client": "",
-        "borrower_name": "",
         "intended_use": "",
         "purpose": "",
         "assignment_type": "",
@@ -318,15 +314,15 @@ def extract_metadata(text: str) -> Dict[str, str]:
     # Effective Date (numeric, 'as of', or Month-name)
     m = re.search(r"(Effective\s+Date|Report\s+Effective\s+Date|Date\s+of\s+Appraised\s+Value)\s*[:=\-]?\s*(\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4})", text, re.IGNORECASE)
     if m:
-        md["effective_date"] = _fmt_date(m.group(2))
+        md["effective_date"] = m.group(2)
     if not md["effective_date"]:
         m = re.search(r"\bas of\s+(\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4})", text, re.IGNORECASE)
         if m:
-            md["effective_date"] = _fmt_date(m.group(1))
+            md["effective_date"] = m.group(1)
     if not md["effective_date"]:
         m = re.search(r"\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s*\d{4}\b", text, re.IGNORECASE)
         if m:
-            md["effective_date"] = _fmt_date(m.group(0))
+            md["effective_date"] = m.group(0)
 
     # Appraiser Name
     m = re.search(r"(Appraiser|Prepared\s+By)\s*[:=\-]?\s*([A-Z][\w'\-]+(?:\s+[A-Z][\w'\-]+){0,3})", text, re.IGNORECASE)
@@ -335,9 +331,6 @@ def extract_metadata(text: str) -> Dict[str, str]:
 
     # Client / Lender
     md["client"] = _extract_client_lender(text) or ""
-
-    # Borrower
-    md["borrower_name"] = _extract_borrower(text) or ""
 
     # Intended Use
     md["intended_use"] = _extract_intended_use(text)
@@ -356,8 +349,10 @@ def extract_metadata(text: str) -> Dict[str, str]:
     m = re.search(r"Assignment\s*Type[^\n]{0,200}", text, re.IGNORECASE)
     if m:
         assign_line = m.group(0)
+
     def picked(opt: str) -> bool:
         return bool(re.search(rf"(☒|☑|✔|■|●|◉|X)\s*{opt}|{opt}\s*(☒|☑|✔|■|●|◉|X)", assign_line, re.IGNORECASE))
+
     if picked("Purchase Transaction"):
         md["assignment_type"] = "Purchase Transaction"
     elif picked("Refinance Transaction"):
@@ -365,11 +360,14 @@ def extract_metadata(text: str) -> Dict[str, str]:
     elif picked("Other"):
         md["assignment_type"] = "Other"
     else:
-        if re.search(r"Purchase\s*Transaction", assign_line, re.IGNORECASE): md["assignment_type"] = "Purchase Transaction"
-        elif re.search(r"Refinance\s*Transaction", assign_line, re.IGNORECASE): md["assignment_type"] = "Refinance Transaction"
-        elif re.search(r"\bOther\b", assign_line, re.IGNORECASE): md["assignment_type"] = "Other"
+        if re.search(r"Purchase\s*Transaction", assign_line, re.IGNORECASE):
+            md["assignment_type"] = "Purchase Transaction"
+        elif re.search(r"Refinance\s*Transaction", assign_line, re.IGNORECASE):
+            md["assignment_type"] = "Refinance Transaction"
+        elif re.search(r"\bOther\b", assign_line, re.IGNORECASE):
+            md["assignment_type"] = "Other"
 
-    # Rights Appraised
+    # Rights Appraised (clean, single selection)
     md["rights_appraised"] = _extract_rights_appraised(text)
 
     # Value Conclusion
@@ -379,6 +377,7 @@ def extract_metadata(text: str) -> Dict[str, str]:
         r"Indicated\s+Value\s+by:\s*Sales\s+Comparison\s+Approach",
         r"Opinion\s+of\s+Value",
         r"Value\s*Conclusion",
+        r"Final\s+Estimate\s+of\s+Value\s*\$?",
         r"Value\s*\(As[-\s]?Is\)",
         r"Appraised\s+Value\s*\(As[-\s]?Is\)",
         r"As[-\s]?Is\s+Value",
@@ -445,20 +444,20 @@ def parse_subject_basics(text: str) -> Dict[str, str]:
     return out
 
 def parse_comps_quick(text: str) -> Dict[str, List[float]]:
-    out: Dict[str, List[float]] = {"comp_gla": [], "miles": [], "dom": []}
+    out = {"comp_gla": [], "miles": [], "dom": []}
 
     # GLA per comp — catch grid columns like "GLA (sf)" and inline mentions
     for m in re.findall(r"(?:Comp\s*#?\s*\d[^\n]{0,120}?(?:GLA(?:\s*\(sf\)|\s*\(sq\s*ft\)|\s*\(sqft\))?|Gross\s+Living\s+Area)[^\d]{0,10}([\d,]{3,}))", text, re.IGNORECASE):
         try:
             out["comp_gla"].append(float(m.replace(",", "")))
-        except Exception:
+        except:
             pass
 
     # distances: "miles" / "mi" (with optional bearings)
     for m in re.findall(r"\b([\d\.]+)\s*(?:miles|mi\.?)\b(?:\s*[NSEW]{1,2})?", text, re.IGNORECASE):
         try:
             out["miles"].append(float(m))
-        except Exception:
+        except:
             pass
 
     # DOM variants
@@ -466,7 +465,7 @@ def parse_comps_quick(text: str) -> Dict[str, List[float]]:
         num = m[0] or m[1]
         try:
             out["dom"].append(float(num))
-        except Exception:
+        except:
             pass
 
     return out
@@ -477,7 +476,7 @@ def summarize_comps_ranges(text: str) -> Dict[str, str]:
     # Adjusted value range like "$157,753 - $178,100" (dash or "to")
     m = re.search(r"\$\s*[\d,]+(?:\.\d{2})?\s*(?:-|to)\s*\$\s*[\d,]+(?:\.\d{2})?", text, re.IGNORECASE)
     if m:
-        out["adj_range"] = m.group(0).replace(" to ", " - ").rstrip(",;.)")
+        out["adj_range"] = m.group(0).replace(" to ", " - ")
 
     # Sale date tags like s10/24;c09/24 OR "10/2024 - 03/2025"
     all_dates = re.findall(r"s(\d{1,2}/\d{2})\s*;\s*c(\d{1,2}/\d{2})", text, re.IGNORECASE)
@@ -502,7 +501,7 @@ def summarize_comps_ranges(text: str) -> Dict[str, str]:
     return out
 
 def find_gross_net_percentages(text: str) -> Dict[str, str]:
-    results: Dict[str, str] = {}
+    results = {}
     for i in range(1, 6):
         m = re.search(
             rf"(Comp\s*#?{i}.*?)(Net\s*Adj[:=\s]+[-+]?\d+\.?\d*\s*%).*?(Gross\s*Adj[:=\s]+[-+]?\d+\.?\d*\s*%)",
@@ -542,7 +541,7 @@ def find_adjustments(text: str, comp_no: int, label: str) -> str:
 # Rule checks (v27 uses it; analyst view uses richer sectioning)
 # ----------------------------
 def check_flags(text: str, md: Dict[str, str]) -> List[str]:
-    flags: List[str] = []
+    flags = []
     # 1004MC presence
     has_mc = re.search(r"\b(1004MC|MARKET\s+CONDITIONS\s+ADDENDUM)\b", text, re.IGNORECASE)
     if not has_mc:
@@ -567,27 +566,27 @@ def summarize_top_flags(flags: List[str], k: int = 3) -> List[str]:
 # ----------------------------
 def gather_core_evidence(pages: List[str], md: Dict[str, str]) -> Dict[str, str]:
     out = {"value": "", "effective_date": "", "rights": "", "client": "", "intended_use": "", "va_case": ""}
-    out["value"] = find_evidence_pageonly(pages, [
+    out["value"] = find_evidence(pages, [
         r"Indicated\s+Value\s+by[:\s]*Sales\s+Comparison|Appraised\s+Value|Final\s+Estimate\s+of\s+Value",
         r"Comparable\s+Summary|Estimated\s+Indicated\s+Value"
     ])
-    out["effective_date"] = find_evidence_pageonly(pages, [
+    out["effective_date"] = find_evidence(pages, [
         r"Effective\s+Date|Date\s+of\s+Appraised\s+Value"
     ])
-    out["rights"] = find_evidence_pageonly(pages, [
+    out["rights"] = find_evidence(pages, [
         r"(Property\s+)?Rights\s+Appraised|Fee\s+Simple|Leasehold"
     ])
-    out["client"] = find_evidence_pageonly(pages, [
+    out["client"] = find_evidence(pages, [
         r"(?:Lender\s*/\s*Client|Client\s*/\s*Lender)\s*[:\-]",
         r"\bClient\s*[:\-]",
         r"\bLender\s*[:\-]"
     ])
-    out["intended_use"] = find_evidence_pageonly(pages, [
+    out["intended_use"] = find_evidence(pages, [
         r"INTENDED\s+USE\s*:",
         r"The\s+intended\s+use"
     ])
     if md.get("va_case_number"):
-        out["va_case"] = find_evidence_pageonly(pages, [
+        out["va_case"] = find_evidence(pages, [
             r"VA\s*(?:Case|Loan)\s*(?:No\.?|Number)?\s*[:#-]"
         ])
     return out
@@ -596,7 +595,7 @@ def gather_core_evidence(pages: List[str], md: Dict[str, str]) -> Dict[str, str]
 # Output composers
 # ----------------------------
 def compose_output_v27(md: Dict[str, str], flags: List[str]) -> str:
-    lines: List[str] = []
+    lines = []
     lines.append("[SECTION 1] REPORT METADATA SNAPSHOT")
     lines.append(f"→ File Name = {md.get('file_name') or '[Not found in file]'}")
     lines.append(f"→ Effective Date = {md.get('effective_date') or '[Not found]'}")
@@ -648,13 +647,13 @@ def compose_output_analyst(md: Dict[str, str], text: str, pages: List[str], req_
     address_ok = False
     if subj_addr_norm:
         occurrences = len(re.findall(re.escape(subj.get("subject_address")), text, re.IGNORECASE))
-        address_ok = occurrences >= 1  # relaxed heuristic
+        address_ok = occurrences >= 1
     passes += 1 if address_ok else 0
     if not address_ok:
         flags_cnt += 1
 
     # Borrower / Client presence (light)
-    borrower_ok = bool(md.get("borrower_name"))
+    borrower_ok = bool(re.search(r"\bBorrower\s*[:=\-]\s*[A-Z][\w'&\s,]+", text, re.IGNORECASE))
     client_ok = bool(md.get("client"))
     passes += (1 if borrower_ok else 0) + (1 if client_ok else 0)
     if not client_ok:
@@ -673,11 +672,8 @@ def compose_output_analyst(md: Dict[str, str], text: str, pages: List[str], req_
     date_txt = r"((?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s*\d{4})"
     eff = re.search(rf"(Effective\s+Date|Date\s+of\s+Appraised\s+Value)\s*[:=\-]?\s*(?:{date_num}|{date_txt})", text, re.IGNORECASE)
     insp = re.search(rf"(Date\s+of\s+Inspection|Inspection\s+Date|inspected\s+on)\s*[:=\-]?\s*(?:{date_num}|{date_txt})", text, re.IGNORECASE)
-    def _pick(m: Optional[re.Match]) -> str:
-        if not m: return ""
-        return (m.group(2) if (m.lastindex and m.group(2)) else (m.group(3) if (m.lastindex and m.lastindex >= 3) else "")) or ""
-    eff_val = _pick(eff)
-    insp_val = _pick(insp)
+    eff_val = eff.group(2) if (eff and eff.lastindex and eff.group(2)) else (eff.group(3) if eff and eff.lastindex and eff.lastindex >= 3 else "")
+    insp_val = insp.group(2) if (insp and insp.lastindex and insp.group(2)) else (insp.group(3) if insp and insp.lastindex and insp.lastindex >= 3 else "")
     date_compared = bool(eff_val and insp_val)
     eff_match = (eff_val == insp_val) if date_compared else False
     passes += 1 if date_compared and eff_match else 0
@@ -698,23 +694,12 @@ def compose_output_analyst(md: Dict[str, str], text: str, pages: List[str], req_
 
     # Executive Summary
     lines.append("EXECUTIVE SUMMARY")
-    lines.append(f"Pass: {passes}  •  Flags: {flags_cnt}")
-    checks = [
-        ("Address match", address_ok),
-        ("Borrower present", borrower_ok),
-        ("Client present", client_ok),
-        ("H&BU present", hbu_ok),
-        ("Garage/carport present", garage_any),
-        ("Dates comparable", date_compared and eff_match),
-        ("Comp GLA found", bool(compq["comp_gla"]))
-    ]
-    legend = "; ".join([("✔ " if ok else "❌ ") + name for name, ok in checks])
-    lines.append(f"Checks: {legend}")
+    lines.append(f"Pass: {passes} • Flags: {flags_cnt}")
     top_flags: List[str] = []
-    if not adj_support:
-        top_flags.append("[USPAP SR 1-4, 2-2(a)(viii)] Adjustments lack clear paired-sales/market support")
     if not address_ok:
         top_flags.append("Subject address consistency not confirmed")
+    if not adj_support:
+        top_flags.append("[USPAP SR 1-4, 2-2(a)(viii)] Adjustments lack clear paired-sales/market support")
     if top_flags:
         lines.append("Top flags: " + "; ".join(top_flags))
     if gaps:
@@ -724,29 +709,21 @@ def compose_output_analyst(md: Dict[str, str], text: str, pages: List[str], req_
     # ------- Core Facts with Evidence pins -------
     comp_summary = summarize_comps_ranges(text)
     pages_evidence = gather_core_evidence(pages, md)
+
     lines.append("CORE FACTS")
-    if subj.get("subject_address"):
-        lines.append(f"Subject Address: {subj['subject_address']}")
-    if md.get("borrower_name"):
-        lines.append(f"Borrower: {md['borrower_name']}")
     if md.get("value_conclusion"):
-        ev = pages_evidence.get("value", "")
-        lines.append(f"Value Conclusion: {md['value_conclusion']}" + (f" (Evidence: {ev})" if ev else ""))
+        lines.append(_with_evidence(f"Value Conclusion: {md['value_conclusion']}", pages_evidence.get("value", "")))
     if md.get("effective_date"):
-        ev = pages_evidence.get("effective_date", "")
-        lines.append(f"Effective Date: {md['effective_date']}" + (f" (Evidence: {ev})" if ev else ""))
+        lines.append(_with_evidence(f"Effective Date: {md['effective_date']}", pages_evidence.get("effective_date", "")))
     if md.get("form_type"):
         lines.append(f"Form Type: {md['form_type']}")
     if md.get("rights_appraised"):
-        ev = pages_evidence.get("rights", "")
-        lines.append(f"Rights Appraised: {md['rights_appraised']}" + (f" (Evidence: {ev})" if ev else ""))
+        lines.append(_with_evidence(f"Rights Appraised: {md['rights_appraised']}", pages_evidence.get("rights", "")))
     lines.append(f"Client / Lender: {md.get('client') or 'N/A'}")
     if md.get("intended_use"):
-        ev = pages_evidence.get("intended_use", "")
-        lines.append(f"Intended Use: {md['intended_use']}" + (f" (Evidence: {ev})" if ev else ""))
+        lines.append(_with_evidence(f"Intended Use: {md['intended_use']}", pages_evidence.get("intended_use", "")))
     if md.get("va_case_number"):
-        ev = pages_evidence.get("va_case", "")
-        lines.append(f"VA Case Number: {md['va_case_number']}" + (f" (Evidence: {ev})" if ev else ""))
+        lines.append(_with_evidence(f"VA Case Number: {md['va_case_number']}", pages_evidence.get("va_case", "")))
     lines.append("")
 
     # ------- Internal Consistency -------
@@ -784,10 +761,7 @@ def compose_output_analyst(md: Dict[str, str], text: str, pages: List[str], req_
         high = f"{int(max(compq['comp_gla'])):,}"
         subj_gla = parse_subject_basics(text).get("subject_gla")
         if subj_gla:
-            try:
-                lines.append(f"✔ Subject is bracketed by comps for Gross Living Area ({int(float(subj_gla)):,} sf vs. comps {low}–{high} sf)")
-            except Exception:
-                lines.append(f"✔ Subject is bracketed by comps for Gross Living Area (subject GLA present; comps {low}–{high} sf)")
+            lines.append(f"✔ Subject is bracketed by comps for Gross Living Area ({int(float(subj_gla)):,} sf vs. comps {low}–{high} sf)")
         else:
             lines.append(f"ℹ️ Subject GLA not found; comp GLA range {low}–{high} sf")
     else:
@@ -805,7 +779,7 @@ def compose_output_analyst(md: Dict[str, str], text: str, pages: List[str], req_
             try:
                 if float(g) >= 25.0:
                     risky.append((i, g))
-            except Exception:
+            except:
                 pass
     if risky:
         cnum, gv = risky[0]
@@ -835,12 +809,12 @@ def compose_output_analyst(md: Dict[str, str], text: str, pages: List[str], req_
     doms = compq["dom"]
     miles_span = f"{min(miles):.2f}–{max(miles):.2f} miles" if len(miles) >= 2 else ("N/A" if not miles else f"{miles[0]:.2f} miles")
     dom_span = f"{int(min(doms))}–{int(max(doms))}" if len(doms) >= 2 else ("N/A" if not doms else f"{int(doms[0])}")
-    lines.append(f"Comparables Used: {comps_used}" + (f" ({miles_span}; DOM {dom_span})" if comps_used != "N/A" else ""))
-
-    adj_range = comp_summary["adj_range"] or "N/A"
-    sale_range = comp_summary["sale_date_range"] or "N/A"
-    lines.append(f"Adjusted Value Range: {adj_range}")
-    lines.append(f"Sale Date Range: {sale_range}")
+    if comps_used != "N/A":
+        lines.append(f"Comparables Used: {comps_used} ({miles_span}; DOM {dom_span})")
+    else:
+        lines.append(f"Comparables Used: {comps_used}")
+    lines.append(f"Adjusted Value Range: {comp_summary['adj_range'] or 'N/A'}")
+    lines.append(f"Sale Date Range: {comp_summary['sale_date_range'] or 'N/A'}")
     lines.append("")
     lines.append(f"— Engine v{ENGINE_VERSION} • req:{req_id}")
     return "\n".join(lines)
