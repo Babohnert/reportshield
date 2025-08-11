@@ -1,8 +1,9 @@
-flask
-flask-cors
-gunicorn
-python-dotenv
-requests
-azure-ai-formrecognizer
-azure-core
-PyMuPDF
+Flask==2.3.3
+Flask-Cors==4.0.0
+gunicorn==22.0.0
+python-dotenv==1.0.1
+requests==2.32.3
+azure-ai-formrecognizer==3.3.2
+azure-core==1.30.2
+PyMuPDF==1.24.9
+pypdf==4.3.1
