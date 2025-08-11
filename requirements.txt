@@ -1,0 +1,8 @@
+flask
+flask-cors
+gunicorn
+python-dotenv
+requests
+azure-ai-formrecognizer
+azure-core
+PyMuPDF

@@ -1,0 +1,31 @@
+OUTPUT RULES – Compliance Audit (v2.7)
+
+FORMAT:
+- Output must be plain text only.
+- Exactly five labeled sections, in this order:
+  [SECTION 1] REPORT METADATA SNAPSHOT
+  [SECTION 2] SUMMARY OF COMPLIANCE FLAGS
+  [SECTION 3] DETAILED FLAGS AND REFERENCES
+  [SECTION 4] TOP FLAGS (CONDENSED)
+  [SECTION 5] ADDITIONAL NOTES
+- No markdown, bullets other than "→", emojis, or styling.
+
+MANDATORY FLAGS TO CHECK:
+- 1004MC (Market Conditions Addendum) presence.
+- VA MPR references when a VA loan is indicated.
+- Signature/date basic consistency.
+
+CONTENT RULES:
+- SECTION 1 lists key metadata: file name, effective date, form type, appraiser name, intended use/client, VA indicator.
+- SECTION 2 prints one line per high-level flag.
+- SECTION 3 mirrors flags from Section 2 for clarity; future versions may include specific citations.
+- SECTION 4 includes the top (up to three) flags only.
+- SECTION 5 allows brief operational notes (3 lines max). No AI commentary or marketing language.
+
+PROHIBITIONS:
+- No internal rule thresholds, prompts, or system metadata in outputs.
+- No tables, HTML, markdown, or code fences.
+- No long explanations or hypotheticals.
+
+ERROR HANDLING:
+- If an unrecoverable error occurs, return status 500 with a short plain-text message starting with "Audit failed:".
