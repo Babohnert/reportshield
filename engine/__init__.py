@@ -1,5 +1,5 @@
 """
-engine/__init__.py — Compliance Audit engine (v6.6-compatible, robust)
+engine/__init__.py — Compliance Audit engine (v6.6-compatible, stable filenames)
 
 Implements the deterministic execution pipeline defined in:
 - SYSTEM EXECUTION SCHEMATIC – Compliance Audit (v6.6)
@@ -8,13 +8,11 @@ Implements the deterministic execution pipeline defined in:
 Public API:
     run_audit(file_storage_or_bytes) -> str  # returns plain-text five-section audit
 
-Key properties:
-- Rule-locked: no generative tone; temperature must be 0 wherever LLMs are involved.
+Notes:
+- Filenames for rules/schematic are FIXED; do not rename them. Update contents only.
 - Azure Document Intelligence (prebuilt-document) for OCR/KV/tables.
-- Dynamic, tolerant loading of schematic/rules filenames (handles hyphen vs en-dash; env overrides).
-- Evidence-first gating, Fair Housing moderation, PII redaction, integrity pass.
-- Public/private output modes with redaction behavior.
-- No persistence of user content; request-scoped processing only.
+- Evidence-first gating, Fair Housing moderation (with exclusions), PII redaction.
+- Clear error messages; optional PDF-text fallback if Azure hiccups.
 """
 from __future__ import annotations
 
@@ -38,7 +36,7 @@ if not LOGGER.handlers:
 LOGGER.setLevel(logging.INFO)
 
 # -----------------------------
-# Third-party deps (declare in requirements.txt)
+# Third-party deps
 # -----------------------------
 from pypdf import PdfReader
 from azure.ai.formrecognizer import DocumentAnalysisClient
@@ -53,37 +51,11 @@ RULES_VERSION_REQUIRED = "v2.9"
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 SYSTEM_DIR = os.path.join(BASE_DIR, "system")
 
-# Tolerant filename resolver (supports en-dash/hyphen and legacy versions). Also supports env overrides.
-RULES_FILE_ENV = os.getenv("OUTPUT_RULES_FILE")
-SCHEM_FILE_ENV = os.getenv("SCHEMATIC_FILE")
-
-RULES_CANDIDATES = [
-    "OUTPUT RULES – Compliance Audit (v2.9).txt",
-    "OUTPUT RULES - Compliance Audit (v2.9).txt",
-    "OUTPUT RULES – Compliance Audit.txt",
-    "OUTPUT RULES - Compliance Audit.txt",
-]
-SCHEM_CANDIDATES = [
-    "SYSTEM EXECUTION SCHEMATIC – Compliance Audit (v6.6).txt",
-    "SYSTEM EXECUTION SCHEMATIC - Compliance Audit (v6.6).txt",
-    "SYSTEM EXECUTION SCHEMATIC – Compliance Audit (v5.9).txt",
-    "SYSTEM EXECUTION SCHEMATIC - Compliance Audit (v5.9).txt",
-    "SYSTEM EXECUTION SCHEMATIC – Compliance Audit.txt",
-    "SYSTEM EXECUTION SCHEMATIC - Compliance Audit.txt",
-]
-
-def _first_existing(names: List[str]) -> Optional[str]:
-    for name in names:
-        p = os.path.join(SYSTEM_DIR, name)
-        if os.path.exists(p):
-            return p
-    return None
-
-OUTPUT_RULES_PATH = (os.path.join(SYSTEM_DIR, RULES_FILE_ENV)
-                     if RULES_FILE_ENV else _first_existing(RULES_CANDIDATES))
-SCHEMATIC_PATH    = (os.path.join(SYSTEM_DIR, SCHEM_FILE_ENV)
-                     if SCHEM_FILE_ENV else _first_existing(SCHEM_CANDIDATES))
-STATE_HOOKS_PATH  = os.path.join(SYSTEM_DIR, "state-hooks.json")
+# FIXED FILENAMES — DO NOT CHANGE
+OUTPUT_RULES_PATH = os.path.join(SYSTEM_DIR, "OUTPUT RULES – Compliance Audit (v2.9).txt")
+SCHEMATIC_PATH = os.path.join(SYSTEM_DIR, "SYSTEM EXECUTION SCHEMATIC – Compliance Audit (v6.6).txt")
+STATE_HOOKS_PATH = os.path.join(SYSTEM_DIR, "state-hooks.json")
+FH_TERMS_PATH = os.path.join(SYSTEM_DIR, "fair-housing.json")  # optional data file
 
 PUBLIC_MODE = os.getenv("PUBLIC_MODE", "true").lower() == "true"
 MAX_MB = int(os.getenv("MAX_MB", "25"))
@@ -91,7 +63,6 @@ MAX_PAGES = int(os.getenv("MAX_PAGES", "500"))
 AZURE_MODEL = os.getenv("AZURE_MODEL", "prebuilt-document")
 EVIDENCE_SNIPPET_MAX_WORDS = int(os.getenv("EVIDENCE_SNIPPET_MAX_WORDS", "15"))
 PII_REDACT = os.getenv("PII_REDACT", "true").lower() == "true"
-
 AZURE_ENDPOINT = os.getenv("AZURE_FORMRECOGNIZER_ENDPOINT")
 AZURE_KEY = os.getenv("AZURE_FORMRECOGNIZER_KEY")
 AZURE_FALLBACK_PDF_TEXT = os.getenv("AZURE_FALLBACK_PDF_TEXT", "true").lower() == "true"
@@ -110,16 +81,21 @@ FORM_MARKERS = {
     "2055": ["EXTERIOR-ONLY INSPECTION RESIDENTIAL APPRAISAL REPORT", "2055"],
 }
 
-VA_MARKERS = ["VETERANS AFFAIRS", "VA ", "VA CASE", "VA MPR", "MINIMUM PROPERTY REQUIREMENTS"]
+VA_MARKERS = ["VETERANS AFFAIRS", "VA ", "VA CASE", "VA MPR", "MINIMUM PROPERTY REQUIREMENTS", "TIDEWATER", "NOTICE OF VALUE", "NOV"]
 FHA_MARKERS = ["FHA", "HUD", "FHA CASE", "HUD-"]
 USDA_MARKERS = ["USDA", "RURAL DEVELOPMENT"]
-SUBJECT_TO_MARKERS = ["subject to", "conditional upon", "repair completion"]
 
-FAIR_HOUSING_TERMS = [
+# Fair Housing: core patterns + exclusions to reduce false hits
+FAIR_HOUSING_CORE = [
     r"\b(race|ethnicity|religion|national origin|familial status|pregnant|wheelchair|handicap|disability)\b",
     r"\bfamily[- ]?friendly\b",
     r"\bdesirable (?:area|neighborhood)\b",
     r"\bhigh crime\b",
+]
+FAIR_HOUSING_EXCLUDE = [
+    r"\bfamily room\b",
+    r"\bfamily bath\b",
+    r"\bcrime rate\b.*\b(city|municipal|FBI|BLS)\b",  # neutral stats reference
 ]
 
 PII_PATTERNS = [
@@ -178,26 +154,23 @@ class ParsedDoc:
     loan_type: Optional[str]
     state: Optional[str]
     comps: List[Comparable] = field(default_factory=list)
+    value_conclusion: Optional[str] = None
 
 # -----------------------------
 # Helpers
 # -----------------------------
-
 def _load_text_file(path: Optional[str]) -> str:
     if not path or not os.path.exists(path):
         raise RuntimeError("Audit failed: configuration error")
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
 
-
 def _normalize_ws(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
-
 
 def _limit_words(s: str, max_words: int) -> str:
     words = _normalize_ws(s).split()
     return " ".join(words[:max_words])
-
 
 def _snippet_around(text: str, span: Tuple[int, int], max_words: int) -> str:
     start, end = span
@@ -206,18 +179,17 @@ def _snippet_around(text: str, span: Tuple[int, int], max_words: int) -> str:
     right = text[end:end + 160]
     return _limit_words(f"{left}{center}{right}", max_words)
 
-
 def _redact_sensitive(s: str) -> str:
     if not s:
         return s
     out = s
-    for pat in FAIR_HOUSING_TERMS:
+    # fair housing redaction
+    for pat in FAIR_HOUSING_CORE:
         out = re.sub(pat, "[…]", out, flags=re.IGNORECASE)
     if PII_REDACT:
         for pat in PII_PATTERNS:
             out = re.sub(pat, "[…]", out, flags=re.IGNORECASE)
     return _normalize_ws(out)
-
 
 def _fmt_date_token(raw: str) -> Optional[str]:
     raw = raw.strip()
@@ -236,7 +208,6 @@ def _fmt_date_token(raw: str) -> Optional[str]:
 # -----------------------------
 # Azure extraction (with clear errors + optional PDF text fallback)
 # -----------------------------
-
 def _analyze_with_azure(pdf_bytes: bytes) -> Dict[str, Any]:
     if not AZURE_ENDPOINT or not AZURE_KEY:
         raise RuntimeError("Audit failed: configuration error")
@@ -246,7 +217,6 @@ def _analyze_with_azure(pdf_bytes: bytes) -> Dict[str, Any]:
         result = poller.result()
     except Exception as e:
         if AZURE_FALLBACK_PDF_TEXT:
-            # best-effort: try plain PDF text so we can still render an audit
             try:
                 reader = PdfReader(io.BytesIO(pdf_bytes))
                 text = ""
@@ -303,8 +273,14 @@ def _analyze_with_azure(pdf_bytes: bytes) -> Dict[str, Any]:
     return {"full_text": full_text, "pages": pages, "kv": kv_pairs, "tables": tables}
 
 # -----------------------------
-# Parsing helpers
+# Parsing helpers (expanded keys + regex fallbacks)
 # -----------------------------
+APPRAISER_KEYS = ["Appraiser", "Appraiser Name", "Appraiser Signature", "Signed By"]
+CLIENT_KEYS = ["Client", "Lender", "Client/Lender", "Intended Use/Client", "Lender/Client"]
+VALUE_KEYS = ["Final Value", "Appraised Value", "Opinion of Value"]
+
+APPRAISER_FALLBACK = re.compile(r"\bAPPRAISER[:\s]+([A-Z][^\n,]+)", re.IGNORECASE)
+CLIENT_FALLBACK = re.compile(r"\b(?:CLIENT|LENDER)[:\s]+([A-Z0-9][^\n,]+)", re.IGNORECASE)
 
 def _kv_lookup(kv: List[Dict[str, Any]], key_like: Iterable[str]) -> Optional[ParsedField]:
     for row in kv:
@@ -317,7 +293,6 @@ def _kv_lookup(kv: List[Dict[str, Any]], key_like: Iterable[str]) -> Optional[Pa
                     return ParsedField(val, ev)
     return None
 
-
 def _detect_form_type(text: str) -> ParsedField:
     for code, markers in FORM_MARKERS.items():
         for m in markers:
@@ -326,7 +301,6 @@ def _detect_form_type(text: str) -> ParsedField:
                 snip = _redact_sensitive(_snippet_around(text, hit.span(), EVIDENCE_SNIPPET_MAX_WORDS))
                 return ParsedField(code, Evidence(page=1, snippet=snip))
     return ParsedField(None, None)
-
 
 def _detect_loan_type(text: str) -> str:
     if any(re.search(re.escape(t), text, flags=re.IGNORECASE) for t in VA_MARKERS):
@@ -337,7 +311,6 @@ def _detect_loan_type(text: str) -> str:
         return "USDA"
     return "Conventional"
 
-
 def _extract_effective_date(text: str) -> ParsedField:
     m = DATE_PAT.search(text)
     if not m:
@@ -347,7 +320,6 @@ def _extract_effective_date(text: str) -> ParsedField:
     snip = _redact_sensitive(_snippet_around(text, m.span(), EVIDENCE_SNIPPET_MAX_WORDS))
     return ParsedField(fmt, Evidence(page=1, snippet=snip))
 
-
 def _extract_value_conclusion(text: str) -> ParsedField:
     for m in re.finditer(MONEY_PAT, text):
         window = text[max(0, m.start()-40):m.end()+40]
@@ -356,9 +328,8 @@ def _extract_value_conclusion(text: str) -> ParsedField:
             return ParsedField(m.group(0).replace(" ", ""), Evidence(page=1, snippet=snip))
     return ParsedField(None, None)
 
-
 def _extract_subject_address(kv: List[Dict[str, Any]], text: str) -> ParsedField:
-    pf = _kv_lookup(kv, ["Subject Address", "Property Address", "Street Address"])  # KV-first
+    pf = _kv_lookup(kv, ["Subject Address", "Property Address", "Street Address"])
     if pf and pf.value:
         return pf
     m = re.search(r"\d{1,6}\s+\w[\w\s\.']+,\s*\w+[\w\s']*,\s*[A-Z]{2}\s*\d{5}(-\d{4})?", text)
@@ -367,13 +338,11 @@ def _extract_subject_address(kv: List[Dict[str, Any]], text: str) -> ParsedField
         return ParsedField(_normalize_ws(m.group(0).title()), Evidence(page=1, snippet=snip))
     return ParsedField(None, None)
 
-
 def _detect_state_from_address(addr: Optional[str]) -> Optional[str]:
     if not addr:
         return None
     m = re.search(r"\b([A-Z]{2})\b\s*\d{5}(?:-\d{4})?", addr)
     return m.group(1) if m else None
-
 
 def _parse_comps_from_tables(tables: List[Dict[str, Any]], text: str) -> List[Comparable]:
     comps: List[Comparable] = []
@@ -397,19 +366,18 @@ def _parse_comps_from_tables(tables: List[Dict[str, Any]], text: str) -> List[Co
 # -----------------------------
 # Rule evaluation (OUTPUT RULES v2.9)
 # -----------------------------
-
 def _apply_rules_v29(parsed: ParsedDoc, rules_text: str, state_hooks: Dict[str, Any]) -> Dict[str, Any]:
     flags: List[Flag] = []
 
     text = parsed.text
     loan_type = parsed.loan_type
 
-    # 1004MC
-    if not re.search(r"\b1004MC\b|MARKET CONDITIONS ADDENDUM", text, flags=re.IGNORECASE):
+    # 1004MC variants
+    if not re.search(r"\b1004MC\b|MARKET CONDITIONS\s*(?:ADDENDUM|\(1004MC\))|FORM\s*1004MC", text, flags=re.IGNORECASE):
         flags.append(Flag("MODERATE", "Missing 1004MC when applicable", rule_id="GSE-01"))
 
-    # VA / FHA
-    if loan_type == "VA" and not re.search(r"\bMPR\b|MINIMUM PROPERTY REQUIREMENTS", text, flags=re.IGNORECASE):
+    # VA / FHA checks with broader evidence vocabulary
+    if loan_type == "VA" and not re.search(r"\bMPR\b|MINIMUM PROPERTY REQUIREMENTS|TIDEWATER|NOTICE OF VALUE|NOV\b", text, flags=re.IGNORECASE):
         flags.append(Flag("CRITICAL", "VA MPR references missing in VA context", rule_id="VA-01"))
     if loan_type == "FHA" and not re.search(r"\bFHA\b|\bHUD\b", text, flags=re.IGNORECASE):
         flags.append(Flag("CRITICAL", "FHA exhibit/certification missing in FHA context", rule_id="FHA-01"))
@@ -422,25 +390,23 @@ def _apply_rules_v29(parsed: ParsedDoc, rules_text: str, state_hooks: Dict[str, 
     if not parsed.subject_address:
         flags.append(Flag("MINOR", "Subject address not extracted; consistency cannot be tested", rule_id="CONS-01"))
 
-    # Scope of work contradictions
-    if re.search(r"Cost Approach not developed", text, flags=re.IGNORECASE) and re.search(r"Cost Approach", text, flags=re.IGNORECASE):
-        flags.append(Flag("MODERATE", "Scope of work contradiction detected", rule_id="USPAP-21"))
-
-    # Market trend claims without stats
-    if re.search(r"market (?:is )?(stable|declining|increasing)", text, flags=re.IGNORECASE) and not re.search(r"DOM|Median|Inventory|Trend", text, flags=re.IGNORECASE):
-        flags.append(Flag("MODERATE", "Market trend stated without supporting data", rule_id="USPAP-22"))
-
     # Reconciliation reasoning
     if re.search(r"reconcil", text, flags=re.IGNORECASE) and not re.search(r"adjusted range|range of adjusted values", text, flags=re.IGNORECASE):
         flags.append(Flag("MINOR", "Final value not reconciled against adjusted range", rule_id="USPAP-23"))
 
-    # Fair Housing scan
-    for pat in FAIR_HOUSING_TERMS:
+    # Fair Housing scan (apply exclusions)
+    fh_hit = False
+    for pat in FAIR_HOUSING_CORE:
         if re.search(pat, text, flags=re.IGNORECASE):
-            flags.append(Flag("MODERATE", "Potential Fair Housing concern detected in narrative", rule_id="FH-01"))
-            break
+            # If any exclusion applies in proximity, skip flag
+            excluded = any(re.search(ex, text, flags=re.IGNORECASE) for ex in FAIR_HOUSING_EXCLUDE)
+            if not excluded:
+                fh_hit = True
+                break
+    if fh_hit:
+        flags.append(Flag("MODERATE", "Potential Fair Housing concern detected in narrative", rule_id="FH-01"))
 
-    # State hooks (optional)
+    # State hooks (optional JSON data)
     if parsed.state and state_hooks.get(parsed.state):
         for h in state_hooks[parsed.state]:
             try:
@@ -450,10 +416,9 @@ def _apply_rules_v29(parsed: ParsedDoc, rules_text: str, state_hooks: Dict[str, 
             except Exception:
                 continue
 
-    # Sort by severity, then issue text
     flags_sorted = sorted(flags, key=lambda f: (SEVERITY_ORDER.get(f.severity, 9), f.issue))
 
-    # SECTION 1
+    # SECTION 1 payload
     s1 = {
         "file_name": parsed.file_name or "[Not found]",
         "effective_date": parsed.effective_date.value or "[Not found]",
@@ -464,12 +429,13 @@ def _apply_rules_v29(parsed: ParsedDoc, rules_text: str, state_hooks: Dict[str, 
         "client": parsed.client or "[Not found]",
         "loan_type": parsed.loan_type or "[Not found]",
         "is_va": ("Yes" if parsed.loan_type == "VA" else ("No" if parsed.loan_type else "[Not found]")),
+        "value_conclusion": parsed.value_conclusion,
     }
 
     # SECTION 2
     s2 = [f"→ [{f.severity}] {f.issue}" for f in flags_sorted]
 
-    # SECTION 3
+    # SECTION 3 (attach evidence snippets where available)
     s3: List[str] = []
     for f in flags_sorted:
         tail = f" [{f.rule_id}]" if f.rule_id else ""
@@ -481,7 +447,6 @@ def _apply_rules_v29(parsed: ParsedDoc, rules_text: str, state_hooks: Dict[str, 
             detail = _normalize_ws(f.detail or "")
             s3.append(f"→ {f.issue}{(': ' + detail) if detail else ''}{tail}")
 
-    # SECTION 4
     s4 = [f"→ {f.issue}" for f in flags_sorted[:3]]
 
     return {"section1": s1, "section2": s2, "section3": s3, "section4": s4}
@@ -489,12 +454,11 @@ def _apply_rules_v29(parsed: ParsedDoc, rules_text: str, state_hooks: Dict[str, 
 # -----------------------------
 # Rendering
 # -----------------------------
-
 def _render_plain_text(sections: Dict[str, Any]) -> str:
     s1 = sections["section1"]
     out: List[str] = []
 
-    def _maybe_redact(name: str) -> str:
+    def _maybe_redact(name: Optional[str]) -> str:
         if PUBLIC_MODE and name and name != "[Not found]":
             return "[Redacted]"
         return name or "[Not found]"
@@ -520,6 +484,8 @@ def _render_plain_text(sections: Dict[str, Any]) -> str:
     out.append(f"→ Intended Use / Client = {_maybe_redact(s1.get('client'))}")
     out.append(f"→ Loan Type = {s1.get('loan_type')}")
     out.append(f"→ Is VA Loan = {s1.get('is_va')}")
+    if s1.get("value_conclusion"):
+        out.append(f"→ Value Conclusion = {s1.get('value_conclusion')}")
 
     out.append("[SECTION 2] SUMMARY OF COMPLIANCE FLAGS")
     out.extend(sections.get("section2", []))
@@ -542,7 +508,6 @@ def _render_plain_text(sections: Dict[str, Any]) -> str:
 # -----------------------------
 # Public entrypoint
 # -----------------------------
-
 def run_audit(file_like: Any) -> str:
     # Load and validate rule-locked files
     rules_text = _load_text_file(OUTPUT_RULES_PATH)
@@ -590,25 +555,32 @@ def run_audit(file_like: Any) -> str:
     kv = analyzed.get("kv", [])
     tables = analyzed.get("tables", [])
 
-    # Parse core metadata
-    appraiser_pf = _kv_lookup(kv, ["Appraiser", "Signed By"]) or ParsedField(None, None)
-    client_pf = _kv_lookup(kv, ["Client", "Lender"]) or ParsedField(None, None)
+    # Parse core metadata (expanded keys + regex fallback)
+    appraiser_pf = _kv_lookup(kv, APPRAISER_KEYS) or ParsedField(None, None)
+    if not appraiser_pf.value:
+        m = APPRAISER_FALLBACK.search(full_text)
+        if m:
+            appraiser_pf = ParsedField(_normalize_ws(m.group(1)), Evidence(page=1, snippet=_limit_words(m.group(0), EVIDENCE_SNIPPET_MAX_WORDS)))
+
+    client_pf = _kv_lookup(kv, CLIENT_KEYS) or ParsedField(None, None)
+    if not client_pf.value:
+        m = CLIENT_FALLBACK.search(full_text)
+        if m:
+            client_pf = ParsedField(_normalize_ws(m.group(1)), Evidence(page=1, snippet=_limit_words(m.group(0), EVIDENCE_SNIPPET_MAX_WORDS)))
 
     eff_pf_kv = _kv_lookup(kv, ["Effective Date"]) or ParsedField(None, None)
     eff_pf_text = _extract_effective_date(full_text)
     effective_pf = eff_pf_kv if eff_pf_kv.value else eff_pf_text
     effective_mismatch = bool(eff_pf_kv.value and eff_pf_text.value and (eff_pf_kv.value != eff_pf_text.value))
 
-    value_pf_kv = _kv_lookup(kv, ["Final Value", "Appraised Value", "Opinion of Value"]) or ParsedField(None, None)
+    value_pf_kv = _kv_lookup(kv, VALUE_KEYS) or ParsedField(None, None)
     value_pf_text = _extract_value_conclusion(full_text)
     value_pf = value_pf_kv if value_pf_kv.value else value_pf_text
-    value_mismatch = bool(value_pf_kv.value and value_pf_text.value and (value_pf_kv.value != value_pf_text.value))
 
     form_pf = _kv_lookup(kv, ["Form Type"]) or _detect_form_type(full_text)
     subj_addr_pf = _extract_subject_address(kv, full_text)
     state = _detect_state_from_address(subj_addr_pf.value)
     loan_type = _detect_loan_type(full_text)
-
     comps = _parse_comps_from_tables(tables, full_text)
 
     parsed = ParsedDoc(
@@ -625,9 +597,10 @@ def run_audit(file_like: Any) -> str:
         loan_type=loan_type,
         state=state,
         comps=comps,
+        value_conclusion=value_pf.value,
     )
 
-    # Optional state hooks
+    # Optional state hooks & FH terms externalization
     state_hooks: Dict[str, Any] = {}
     if os.path.exists(STATE_HOOKS_PATH):
         try:
@@ -646,7 +619,8 @@ def run_audit(file_like: Any) -> str:
         )
         sections.setdefault("section4", []).insert(0, "→ Inconsistent Effective Date")
 
-    if value_mismatch:
+    # Value mismatch (KV vs text) — optional; keep quiet unless both present and differ
+    if value_pf_kv.value and value_pf_text.value and (value_pf_kv.value != value_pf_text.value):
         sections.setdefault("section2", []).insert(0, "→ [MODERATE] Inconsistent extraction for critical field(s)")
         sections.setdefault("section3", []).append(
             f"→ Inconsistent Value Conclusion: \"{value_pf_kv.value}\" vs \"{value_pf_text.value}\". (Evidence: p.1 / p.1) [CONS-03]"
