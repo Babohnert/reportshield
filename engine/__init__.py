@@ -13,6 +13,8 @@ Notes:
 - Azure Document Intelligence (prebuilt-document) for OCR/KV/tables.
 - Evidence-first gating, Fair Housing moderation (with exclusions), PII redaction.
 - Clear error messages; optional PDF-text fallback if Azure hiccups.
+- Emoji decoration prepends a single emoji to any line containing a bracketed label
+  (e.g., "[CRITICAL]", "[MODERATE]", "[MINOR]") per OUTPUT RULES.
 """
 from __future__ import annotations
 
@@ -106,6 +108,29 @@ PII_PATTERNS = [
 SEVERITY_ORDER = {"CRITICAL": 0, "MODERATE": 1, "MINOR": 2}
 
 # -----------------------------
+# Emoji config
+# -----------------------------
+FLAG_EMOJI: Dict[str, str] = {
+    "CRITICAL": "🔴",
+    "MODERATE": "🟠",
+    "MINOR": "🔵",
+    # Optional extras if upstream ever emits these:
+    "DATA GAP": "🟡",
+    "PASS": "🟢",
+}
+
+FLAG_SYNONYMS: Dict[str, str] = {
+    "MAJOR": "CRITICAL",
+    "WARNING": "MODERATE",   # treat WARNING as MODERATE in this engine
+    "INFO": "MINOR",
+    "NOTE": "MINOR",
+    "GAP": "DATA GAP",
+    "OK": "PASS",
+}
+
+LABEL_PATTERN = re.compile(r"\[(?P<label>[A-Z ]+?)\]")
+
+# -----------------------------
 # Data structures
 # -----------------------------
 @dataclass
@@ -159,18 +184,22 @@ class ParsedDoc:
 # -----------------------------
 # Helpers
 # -----------------------------
+
 def _load_text_file(path: Optional[str]) -> str:
     if not path or not os.path.exists(path):
         raise RuntimeError("Audit failed: configuration error")
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
 
+
 def _normalize_ws(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
+
 
 def _limit_words(s: str, max_words: int) -> str:
     words = _normalize_ws(s).split()
     return " ".join(words[:max_words])
+
 
 def _snippet_around(text: str, span: Tuple[int, int], max_words: int) -> str:
     start, end = span
@@ -178,6 +207,7 @@ def _snippet_around(text: str, span: Tuple[int, int], max_words: int) -> str:
     center = text[start:end]
     right = text[end:end + 160]
     return _limit_words(f"{left}{center}{right}", max_words)
+
 
 def _redact_sensitive(s: str) -> str:
     if not s:
@@ -190,6 +220,7 @@ def _redact_sensitive(s: str) -> str:
         for pat in PII_PATTERNS:
             out = re.sub(pat, "[…]", out, flags=re.IGNORECASE)
     return _normalize_ws(out)
+
 
 def _fmt_date_token(raw: str) -> Optional[str]:
     raw = raw.strip()
@@ -208,6 +239,7 @@ def _fmt_date_token(raw: str) -> Optional[str]:
 # -----------------------------
 # Azure extraction (with clear errors + optional PDF text fallback)
 # -----------------------------
+
 def _analyze_with_azure(pdf_bytes: bytes) -> Dict[str, Any]:
     if not AZURE_ENDPOINT or not AZURE_KEY:
         raise RuntimeError("Audit failed: configuration error")
@@ -282,6 +314,7 @@ VALUE_KEYS = ["Final Value", "Appraised Value", "Opinion of Value"]
 APPRAISER_FALLBACK = re.compile(r"\bAPPRAISER[:\s]+([A-Z][^\n,]+)", re.IGNORECASE)
 CLIENT_FALLBACK = re.compile(r"\b(?:CLIENT|LENDER)[:\s]+([A-Z0-9][^\n,]+)", re.IGNORECASE)
 
+
 def _kv_lookup(kv: List[Dict[str, Any]], key_like: Iterable[str]) -> Optional[ParsedField]:
     for row in kv:
         rk = row.get("key", "").lower()
@@ -293,6 +326,7 @@ def _kv_lookup(kv: List[Dict[str, Any]], key_like: Iterable[str]) -> Optional[Pa
                     return ParsedField(val, ev)
     return None
 
+
 def _detect_form_type(text: str) -> ParsedField:
     for code, markers in FORM_MARKERS.items():
         for m in markers:
@@ -301,6 +335,7 @@ def _detect_form_type(text: str) -> ParsedField:
                 snip = _redact_sensitive(_snippet_around(text, hit.span(), EVIDENCE_SNIPPET_MAX_WORDS))
                 return ParsedField(code, Evidence(page=1, snippet=snip))
     return ParsedField(None, None)
+
 
 def _detect_loan_type(text: str) -> str:
     if any(re.search(re.escape(t), text, flags=re.IGNORECASE) for t in VA_MARKERS):
@@ -311,6 +346,7 @@ def _detect_loan_type(text: str) -> str:
         return "USDA"
     return "Conventional"
 
+
 def _extract_effective_date(text: str) -> ParsedField:
     m = DATE_PAT.search(text)
     if not m:
@@ -320,6 +356,7 @@ def _extract_effective_date(text: str) -> ParsedField:
     snip = _redact_sensitive(_snippet_around(text, m.span(), EVIDENCE_SNIPPET_MAX_WORDS))
     return ParsedField(fmt, Evidence(page=1, snippet=snip))
 
+
 def _extract_value_conclusion(text: str) -> ParsedField:
     for m in re.finditer(MONEY_PAT, text):
         window = text[max(0, m.start()-40):m.end()+40]
@@ -328,21 +365,24 @@ def _extract_value_conclusion(text: str) -> ParsedField:
             return ParsedField(m.group(0).replace(" ", ""), Evidence(page=1, snippet=snip))
     return ParsedField(None, None)
 
+
 def _extract_subject_address(kv: List[Dict[str, Any]], text: str) -> ParsedField:
     pf = _kv_lookup(kv, ["Subject Address", "Property Address", "Street Address"])
     if pf and pf.value:
         return pf
-    m = re.search(r"\d{1,6}\s+\w[\w\s\.']+,\s*\w+[\w\s']*,\s*[A-Z]{2}\s*\d{5}(-\d{4})?", text)
+    m = re.search(r"\d{1,6}\s+\w[\w\s\.'']+,\s*\w+[\w\s']*,\s*[A-Z]{2}\s*\d{5}(-\d{4})?", text)
     if m:
         snip = _redact_sensitive(_snippet_around(text, m.span(), EVIDENCE_SNIPPET_MAX_WORDS))
         return ParsedField(_normalize_ws(m.group(0).title()), Evidence(page=1, snippet=snip))
     return ParsedField(None, None)
+
 
 def _detect_state_from_address(addr: Optional[str]) -> Optional[str]:
     if not addr:
         return None
     m = re.search(r"\b([A-Z]{2})\b\s*\d{5}(?:-\d{4})?", addr)
     return m.group(1) if m else None
+
 
 def _parse_comps_from_tables(tables: List[Dict[str, Any]], text: str) -> List[Comparable]:
     comps: List[Comparable] = []
@@ -366,6 +406,7 @@ def _parse_comps_from_tables(tables: List[Dict[str, Any]], text: str) -> List[Co
 # -----------------------------
 # Rule evaluation (OUTPUT RULES v2.9)
 # -----------------------------
+
 def _apply_rules_v29(parsed: ParsedDoc, rules_text: str, state_hooks: Dict[str, Any]) -> Dict[str, Any]:
     flags: List[Flag] = []
 
@@ -398,7 +439,6 @@ def _apply_rules_v29(parsed: ParsedDoc, rules_text: str, state_hooks: Dict[str, 
     fh_hit = False
     for pat in FAIR_HOUSING_CORE:
         if re.search(pat, text, flags=re.IGNORECASE):
-            # If any exclusion applies in proximity, skip flag
             excluded = any(re.search(ex, text, flags=re.IGNORECASE) for ex in FAIR_HOUSING_EXCLUDE)
             if not excluded:
                 fh_hit = True
@@ -454,6 +494,7 @@ def _apply_rules_v29(parsed: ParsedDoc, rules_text: str, state_hooks: Dict[str, 
 # -----------------------------
 # Rendering
 # -----------------------------
+
 def _render_plain_text(sections: Dict[str, Any]) -> str:
     s1 = sections["section1"]
     out: List[str] = []
@@ -506,8 +547,47 @@ def _render_plain_text(sections: Dict[str, Any]) -> str:
     return txt
 
 # -----------------------------
+# Emoji decoration
+# -----------------------------
+
+def _decorate_emojis(text: str) -> str:
+    """Prepend a single emoji to lines that include a bracketed label (e.g., [CRITICAL]).
+    - Skips section headers ("[SECTION X]")
+    - Exactly one emoji per line (no dupe if already present)
+    - Normalizes synonyms to the canonical label set
+    """
+    lines = text.splitlines()
+    out_lines: List[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("[SECTION "):
+            out_lines.append(line)
+            continue
+
+        m = LABEL_PATTERN.search(line)
+        if not m:
+            out_lines.append(line)
+            continue
+
+        raw = m.group("label").strip()
+        norm = FLAG_SYNONYMS.get(raw, raw)
+        emoji = FLAG_EMOJI.get(norm)
+        if not emoji:
+            out_lines.append(line)
+            continue
+
+        # Don't double-prepend if an emoji already starts the visible content
+        if not line.lstrip().startswith(tuple(FLAG_EMOJI.values())):
+            line = f"{emoji} {line}"
+        out_lines.append(line)
+
+    return "\n".join(out_lines)
+
+# -----------------------------
 # Public entrypoint
 # -----------------------------
+
 def run_audit(file_like: Any) -> str:
     # Load and validate rule-locked files
     rules_text = _load_text_file(OUTPUT_RULES_PATH)
@@ -619,7 +699,6 @@ def run_audit(file_like: Any) -> str:
         )
         sections.setdefault("section4", []).insert(0, "→ Inconsistent Effective Date")
 
-    # Value mismatch (KV vs text) — optional; keep quiet unless both present and differ
     if value_pf_kv.value and value_pf_text.value and (value_pf_kv.value != value_pf_text.value):
         sections.setdefault("section2", []).insert(0, "→ [MODERATE] Inconsistent extraction for critical field(s)")
         sections.setdefault("section3", []).append(
@@ -627,4 +706,6 @@ def run_audit(file_like: Any) -> str:
         )
         sections.setdefault("section4", []).insert(0, "→ Inconsistent Value Conclusion")
 
-    return _render_plain_text(sections)
+    # Render → decorate with emojis → return
+    plain = _render_plain_text(sections)
+    return _decorate_emojis(plain)
