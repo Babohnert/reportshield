@@ -1,7 +1,7 @@
 import io
 import os
 import re
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -16,43 +16,31 @@ import fitz  # PyMuPDF
 # ----------------------------
 # Environment / Clients
 # ----------------------------
-def _sanitize_endpoint(raw: Optional[str]) -> Optional[str]:
-    if not raw:
-        return raw
-    ep = raw.strip().strip('"').strip("'")
-    # sometimes users prepend '=' by mistake when pasting envs
-    if ep.startswith("="):
-        ep = ep[1:]
-    # drop any trailing slash
-    if ep.endswith("/"):
-        ep = ep[:-1]
-    return ep
+AZURE_ENDPOINT = os.getenv("AZURE_FORMRECOGNIZER_ENDPOINT")
+AZURE_KEY = os.getenv("AZURE_FORMRECOGNIZER_KEY")
 
-AZURE_ENDPOINT = _sanitize_endpoint(os.getenv("AZURE_FORMRECOGNIZER_ENDPOINT"))
-AZURE_KEY = (os.getenv("AZURE_FORMRECOGNIZER_KEY") or "").strip()
+# Feature toggles
+SHOW_VERBOSE_EVIDENCE = os.getenv("SHOW_VERBOSE_EVIDENCE", "1") not in ("0", "false", "False")
+USE_AZURE = os.getenv("USE_AZURE", "1") not in ("0", "false", "False")
 
 if not AZURE_ENDPOINT or not AZURE_KEY:
-    raise RuntimeError(
-        "Azure Form Recognizer endpoint/key not set. "
-        "Add AZURE_FORMRECOGNIZER_ENDPOINT and AZURE_FORMRECOGNIZER_KEY to your .env"
+    # Keep a clear message; app can still run with USE_AZURE=0
+    if USE_AZURE:
+        raise RuntimeError(
+            "Azure Form Recognizer endpoint/key not set. "
+            "Add AZURE_FORMRECOGNIZER_ENDPOINT and AZURE_FORMRECOGNIZER_KEY to your environment."
+        )
+
+doc_client = None
+if USE_AZURE:
+    doc_client = DocumentAnalysisClient(
+        endpoint=AZURE_ENDPOINT,
+        credential=AzureKeyCredential(AZURE_KEY)
     )
 
-doc_client = DocumentAnalysisClient(
-    endpoint=AZURE_ENDPOINT,
-    credential=AzureKeyCredential(AZURE_KEY)
-)
-
 SYSTEM_DIR = os.path.join(os.path.dirname(__file__), "..", "system")
-OUTPUT_STYLE = os.getenv("OUTPUT_STYLE", "analyst").lower()  # "analyst" (default) | "v27" | "va"
+OUTPUT_STYLE = os.getenv("OUTPUT_STYLE", "analyst").lower()  # "analyst" (default) or "v27"
 ENGINE_VERSION = "1.5"
-
-# Configurable evidence/snippet settings
-EVIDENCE_CHARS = int(os.getenv("EVIDENCE_CHARS", "140"))  # max chars for snippet
-EVIDENCE_MAX_PAGES = int(os.getenv("EVIDENCE_MAX_PAGES", "30"))  # scan up to N pages for evidence pins
-ALLOW_PYMUPDF_FALLBACK = (os.getenv("ALLOW_PYMUPDF_FALLBACK", "true").strip().lower() != "false")
-
-# Toggle to show "(Evidence: …)" snippets throughout
-SHOW_VERBOSE_EVIDENCE = os.getenv("SHOW_VERBOSE_EVIDENCE", "true").strip().lower() != "false"
 
 # ============================
 # Utility helpers
@@ -84,7 +72,7 @@ def _normalize_text(t: str) -> str:
 def _clean_sentence(s: str) -> str:
     """
     Trim boilerplate and dangling determiners like "The." or "This."
-    Keep a single sentence, capped to ~240 chars.
+    Keep a single sentence, capped at ~240 chars.
     """
     if not s:
         return ""
@@ -140,9 +128,7 @@ def extract_pages_text(raw: bytes) -> List[str]:
     pages = []
     try:
         doc = fitz.open(stream=raw, filetype="pdf")
-        for idx, p in enumerate(doc):
-            if idx >= EVIDENCE_MAX_PAGES:
-                break
+        for p in doc:
             pages.append(_normalize_text(p.get_text("text")))
         doc.close()
     except Exception:
@@ -153,7 +139,6 @@ def find_evidence(pages: List[str], patterns: List[str]) -> str:
     """
     Search page texts for any of the patterns; return 'p.X: <snippet...>'.
     """
-    max_chars = max(40, min(EVIDENCE_CHARS, 240))
     for i, page in enumerate(pages, start=1):
         for pat in patterns:
             m = re.search(pat, page, re.IGNORECASE | re.DOTALL)
@@ -161,11 +146,9 @@ def find_evidence(pages: List[str], patterns: List[str]) -> str:
                 start = max(0, m.start() - 80)
                 end = min(len(page), m.end() + 80)
                 snip = page[start:end]
-                # trim common headers that pollute snippets
-                snip = re.sub(r"(?i)SUMMARY OF SALIENT FEATURES.*?$", "", snip)
                 snip = re.sub(r"\s+", " ", snip).strip()
-                if len(snip) > max_chars:
-                    snip = snip[: max_chars - 1] + "…"
+                if len(snip) > 160:
+                    snip = snip[:158] + "…"
                 return f"p.{i}: {snip}"
     return ""
 
@@ -177,14 +160,9 @@ def _with_evidence(line: str, ev: str) -> str:
 # ============================
 # Azure extraction w/ PDF guard + autoslim + HARD FALLBACK
 # ============================
-def extract_text_with_azure(file_obj) -> Tuple[str, bytes, str]:
-    """
-    Returns: (text, raw_bytes, source_used)
-    source_used ∈ {"azure", "pymupdf"}
-    """
+def extract_text_with_azure(file_obj) -> Tuple[str, bytes]:
     raw = _read_as_bytes(file_obj)
     data = raw
-    source_used = "azure"
 
     # If it's a PDF, check encryption and optionally compress to avoid Azure size issues
     if raw[:5].startswith(b"%PDF"):
@@ -203,6 +181,11 @@ def extract_text_with_azure(file_obj) -> Tuple[str, bytes, str]:
             raise
         except Exception:
             data = raw  # continue with original bytes
+
+    # Bypass Azure entirely if toggle is off
+    if not USE_AZURE or doc_client is None:
+        local = extract_text_with_pymupdf(raw)
+        return _normalize_text(local), raw
 
     try:
         # ---- Primary path: Azure DI ----
@@ -224,9 +207,8 @@ def extract_text_with_azure(file_obj) -> Tuple[str, bytes, str]:
             fallback = extract_text_with_pymupdf(raw)
             if len(fallback) > len(text):
                 text = fallback
-                source_used = "pymupdf"
 
-        return text, raw, source_used
+        return text, raw
 
     except Exception as ex:
         # ---- Hard fallback: never fail the whole request just because Azure flaked ----
@@ -234,11 +216,9 @@ def extract_text_with_azure(file_obj) -> Tuple[str, bytes, str]:
             print(f"[WARN] Azure analysis failed; falling back to local extraction: {ex}")
         except Exception:
             pass
-        if not ALLOW_PYMUPDF_FALLBACK:
-            raise RuntimeError("Azure analysis failed and local fallback is disabled.")
         fallback = extract_text_with_pymupdf(raw)
         if fallback:
-            return _normalize_text(fallback), raw, "pymupdf"
+            return _normalize_text(fallback), raw
         # If even local extraction fails, surface a clean error
         raise RuntimeError("Azure analysis failed and local text extraction also failed. "
                            "Try a different or smaller PDF.")
@@ -254,25 +234,31 @@ FORM_KEYWORDS = [
 
 def _extract_client_lender(text: str) -> str:
     """
-    Target the 'Lender/Client' block specifically and avoid invoice-like bleed and header echoes.
+    Target the 'Lender/Client' block specifically and avoid invoice-like or heading bleed.
     """
+    BAD_HEADINGS = r"(SUMMARY OF SALIENT FEATURES|SCOPE OF WORK|TABLE OF CONTENTS|TABLE\s+OF\s+CONTENTS)"
     for pat in [
-        r"(?:Lender\s*/\s*Client|Client\s*/\s*Lender)\s*[:\-]?\s*([^\n]{2,160})",
-        r"\bClient\s*[:\-]\s*([^\n]{2,160})",
-        r"\bLender\s*[:\-]\s*([^\n]{2,160})",
+        r"(?:Lender\s*/\s*Client|Client\s*/\s*Lender)\s*[:\-]?\s*([^\n]{2,120})",
+        r"\bClient\s*[:\-]\s*([^\n]{2,120})",
+        r"\bLender\s*[:\-]\s*([^\n]{2,120})",
     ]:
         m = re.search(pat, text, re.IGNORECASE)
         if m:
             cand = m.group(1).strip()
-            # Guard against invoice fragments & common headers
-            if re.search(r"(?i)Purchaser/Borrower|DESCRIPTION\s+FEES|TOTAL\s+DUE|Check\s+#|SUMMARY OF SALIENT FEATURES", cand):
+
+            # Guard: skip obvious headings or billing fragments
+            if re.search(BAD_HEADINGS, cand, re.IGNORECASE):
                 continue
-            cand = re.split(r"\s{2,}|\s/\s|\s{0,1}\|", cand)[0].strip()
+            if re.search(r"Purchaser/Borrower|DESCRIPTION\s+FEES|TOTAL\s+DUE|Check\s+#", cand, re.IGNORECASE):
+                continue
+            # Skip shouty all-caps headings
+            if re.fullmatch(r"[A-Z\s/&\-\.,]{10,}", cand):
+                continue
+
+            # Trim at slashes or extra separators
+            cand = re.split(r"\s{2,}|\s/\s", cand)[0].strip()
             cand = re.sub(r"\s{2,}", " ", cand).strip()
-            # Remove trailing role labels if present
-            cand = re.sub(r"(?i)\b(Borrower|Co-?Borrower|Lender|Client)\b.*$", "", cand).strip()
-            if cand and cand.lower() not in {"case", "n/a", "na"}:
-                return cand
+            return cand if cand and cand.lower() != "case" else ""
     return ""
 
 def _extract_rights_appraised(text: str) -> str:
@@ -280,7 +266,7 @@ def _extract_rights_appraised(text: str) -> str:
     Choose a single rights selection, preferring a checked option near the Rights Appraised label.
     """
     block = ""
-    m = re.search(r"(Rights\s+Appraised|Property\s+Rights\s+Appraised)[^\n]{0,200}", text, re.IGNORECASE)
+    m = re.search(r"(Rights\s+Appraised|Property\s+Rights\s+Appraised)[^\n]{0,160}", text, re.IGNORECASE)
     if m:
         block = m.group(0)
 
@@ -310,20 +296,27 @@ def _extract_intended_use(text: str) -> str:
         return _clean_sentence(m.group(1))
     return "Mortgage Lending."
 
-def _extract_inspection_date(text: str) -> str:
-    date_num = r"(\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4})"
-    date_txt = r"((?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s*\d{4})"
-    m = re.search(rf"(Date\s+of\s+Inspection|Inspection\s+Date|inspected\s+on)\s*[:=\-]?\s*(?:{date_num}|{date_txt})", text, re.IGNORECASE)
-    if not m:
-        return ""
-    # prefer whichever captured group exists
-    return (m.group(2) if (m.lastindex and m.group(2)) else (m.group(3) if (m.lastindex and m.lastindex >= 3) else "")).strip()
+def _extract_va_case(text: str) -> str:
+    """
+    Pull VA case and normalize to 26-26-X-XXXXXXX (where X is alnum; middle char typically a letter).
+    Accept a variety of messy inputs.
+    """
+    cands = re.findall(
+        r"(?:VA\s*(?:Case|Loan)\s*(?:No\.?|Number)?:?\s*)?([26][\s-]?26[\s-]?[A-Za-z0-9][\s-]?[A-Za-z0-9]{7})",
+        text, re.IGNORECASE
+    )
+    for c in cands:
+        digits = re.sub(r"[^A-Za-z0-9]", "", c)
+        if len(digits) >= 12 and digits[:4] == "2626":
+            mid = (digits[4:5] or "X").upper()
+            tail = (digits[5:12] + "0"*7)[:7]
+            return f"26-26-{mid}-{tail}"
+    return ""
 
 def extract_metadata(text: str) -> Dict[str, str]:
     md = {
         "file_name": "[Not found in file]",
         "effective_date": "",
-        "inspection_date": "",
         "form_type": "",
         "appraiser_name": "",
         "client": "",
@@ -348,9 +341,6 @@ def extract_metadata(text: str) -> Dict[str, str]:
         m = re.search(r"\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s*\d{4}\b", text, re.IGNORECASE)
         if m:
             md["effective_date"] = m.group(0)
-
-    # Inspection Date (new)
-    md["inspection_date"] = _extract_inspection_date(text)
 
     # Appraiser Name
     m = re.search(r"(Appraiser|Prepared\s+By)\s*[:=\-]?\s*([A-Z][\w'\-]+(?:\s+[A-Z][\w'\-]+){0,3})", text, re.IGNORECASE)
@@ -432,18 +422,15 @@ def extract_metadata(text: str) -> Dict[str, str]:
         md["va_case_number"] = va_case
         md["is_va_loan"] = "Yes"
     else:
-        va_hits = any([
+        va_hits = [
             re.search(r"\bDepartment\s+of\s+Veterans\s+Affairs\b", text, re.IGNORECASE),
             re.search(r"\bVA\s+Loan\b", text, re.IGNORECASE),
             re.search(r"\bVA\s+Case\b", text, re.IGNORECASE),
             re.search(r"\bVA\s+Appraisal\b", text, re.IGNORECASE),
             re.search(r"\bLAPP\b", text, re.IGNORECASE),
             re.search(r"\bTAS\b", text, re.IGNORECASE),
-            re.search(r"\bNotice\s+of\s+Value\b|\bNOV\b", text, re.IGNORECASE),
-            re.search(r"\bTidewater\b", text, re.IGNORECASE),
-            re.search(r"\bSAR\b", text, re.IGNORECASE),
-        ])
-        md["is_va_loan"] = "Yes" if va_hits else "No"
+        ]
+        md["is_va_loan"] = "Yes" if any(va_hits) else "No"
 
     return md
 
@@ -481,14 +468,14 @@ def parse_comps_quick(text: str) -> Dict[str, List[float]]:
     for m in re.findall(r"(?:Comp\s*#?\s*\d[^\n]{0,120}?(?:GLA(?:\s*\(sf\)|\s*\(sq\s*ft\)|\s*\(sqft\))?|Gross\s+Living\s+Area)[^\d]{0,10}([\d,]{3,}))", text, re.IGNORECASE):
         try:
             out["comp_gla"].append(float(m.replace(",", "")))
-        except:
+        except Exception:
             pass
 
     # distances: "miles" / "mi" (with optional bearings)
     for m in re.findall(r"\b([\d\.]+)\s*(?:miles|mi\.?)\b(?:\s*[NSEW]{1,2})?", text, re.IGNORECASE):
         try:
             out["miles"].append(float(m))
-        except:
+        except Exception:
             pass
 
     # DOM variants
@@ -496,7 +483,7 @@ def parse_comps_quick(text: str) -> Dict[str, List[float]]:
         num = m[0] or m[1]
         try:
             out["dom"].append(float(num))
-        except:
+        except Exception:
             pass
 
     return out
@@ -507,9 +494,7 @@ def summarize_comps_ranges(text: str) -> Dict[str, str]:
     # Adjusted value range like "$157,753 - $178,100" (dash or "to")
     m = re.search(r"\$\s*[\d,]+(?:\.\d{2})?\s*(?:-|to)\s*\$\s*[\d,]+(?:\.\d{2})?", text, re.IGNORECASE)
     if m:
-        rng = m.group(0).replace(" to ", " - ")
-        rng = rng.replace(" - ", " – ")  # en dash
-        out["adj_range"] = rng
+        out["adj_range"] = m.group(0).replace(" to ", " - ")
 
     # Sale date tags like s10/24;c09/24 OR "10/2024 - 03/2025"
     all_dates = re.findall(r"s(\d{1,2}/\d{2})\s*;\s*c(\d{1,2}/\d{2})", text, re.IGNORECASE)
@@ -598,16 +583,13 @@ def summarize_top_flags(flags: List[str], k: int = 3) -> List[str]:
 # Evidence helpers (page pins)
 # ----------------------------
 def gather_core_evidence(pages: List[str], md: Dict[str, str]) -> Dict[str, str]:
-    out = {"value": "", "effective_date": "", "inspection_date": "", "rights": "", "client": "", "intended_use": "", "va_case": ""}
+    out = {"value": "", "effective_date": "", "rights": "", "client": "", "intended_use": "", "va_case": ""}
     out["value"] = find_evidence(pages, [
         r"Indicated\s+Value\s+by[:\s]*Sales\s+Comparison|Appraised\s+Value|Final\s+Estimate\s+of\s+Value",
         r"Comparable\s+Summary|Estimated\s+Indicated\s+Value"
     ])
     out["effective_date"] = find_evidence(pages, [
         r"Effective\s+Date|Date\s+of\s+Appraised\s+Value"
-    ])
-    out["inspection_date"] = find_evidence(pages, [
-        r"Date\s+of\s+Inspection|Inspection\s+Date|inspected\s+on"
     ])
     out["rights"] = find_evidence(pages, [
         r"(Property\s+)?Rights\s+Appraised|Fee\s+Simple|Leasehold"
@@ -635,8 +617,6 @@ def compose_output_v27(md: Dict[str, str], flags: List[str]) -> str:
     lines.append("[SECTION 1] REPORT METADATA SNAPSHOT")
     lines.append(f"→ File Name = {md.get('file_name') or '[Not found in file]'}")
     lines.append(f"→ Effective Date = {md.get('effective_date') or '[Not found]'}")
-    if md.get("inspection_date"):
-        lines.append(f"→ Inspection Date = {md.get('inspection_date')}")
     lines.append(f"→ Form Type = {md.get('form_type') or '[Not found]'}")
     lines.append(f"→ Appraiser Name = {md.get('appraiser_name') or '[Not found]'}")
     lines.append(f"→ Intended Use / Client = {(md.get('intended_use') or '[Not found]')} / {(md.get('client') or '[Not found]')}")
@@ -651,7 +631,7 @@ def compose_output_v27(md: Dict[str, str], flags: List[str]) -> str:
     else:
         lines.append("→ No material compliance flags detected by automated checks.")
     lines.append("")
-    lines.append("[SECTION 3] DETAILED FLAGS AND REFERENCES")
+    lines.append("[SECTION 3] DETAILED FLAGS AND REFERENCES]")
     if flags:
         for f in flags:
             lines.append(f"→ {f}")
@@ -671,7 +651,7 @@ def compose_output_v27(md: Dict[str, str], flags: List[str]) -> str:
     lines.append("")
     return "\n".join(lines)
 
-def compose_output_analyst(md: Dict[str, str], text: str, pages: List[str], req_id: str, source_used: str) -> str:
+def compose_output_analyst(md: Dict[str, str], text: str, pages: List[str], req_id: str) -> str:
     lines: List[str] = []
 
     # ------- Executive Summary counts -------
@@ -685,8 +665,8 @@ def compose_output_analyst(md: Dict[str, str], text: str, pages: List[str], req_
     address_ok = False
     if subj_addr_norm:
         # Look for at least one mention elsewhere in the doc, not just header line
-        occurrences = len(re.findall(re.escape(subj.get("subject_address")), text, re.IGNORECASE))
-        address_ok = occurrences >= 1  # relaxed to 1 due to OCR variance
+        occurrences = len(re.findall(re.escape(subj.get("subject_address") or ""), text, re.IGNORECASE))
+        address_ok = occurrences >= 1  # relaxed due to OCR variance
     passes += 1 if address_ok else 0
     if not address_ok:
         flags_cnt += 1
@@ -699,9 +679,7 @@ def compose_output_analyst(md: Dict[str, str], text: str, pages: List[str], req_
         gaps.append("Client/Lender")
 
     # H&BU simple presence
-    hbu_ok = bool(re.search(
-        r"Highest\s*&?\s*Best\s*Use.*?(present\s*use|as\s*improved|vacant)|Is\s+the\s+highest\s+and\s+best\s+use.*?\bYes\b",
-        text, re.IGNORECASE))
+    hbu_ok = bool(re.search(r"Highest\s*&?\s*Best\s*Use.*?(present\s*use|as\s*improved|vacant)|Is\s+the\s+highest\s+and\s+best\s+use.*?\bYes\b", text, re.IGNORECASE))
     passes += 1 if hbu_ok else 0
 
     # Garage/carport presence in at least one section
@@ -728,12 +706,8 @@ def compose_output_analyst(md: Dict[str, str], text: str, pages: List[str], req_
     else:
         gaps.append("Comp GLA range")
 
-    # USPAP adjustment support — broaden accepted phrases
-    adj_support = bool(re.search(
-        r"(paired\s+sales|market\s+support|contributory\s+value|extracted\s+from\s+sales|time\s+adjustment\s+support|"
-        r"market[-\s]*derived\s+adjustment|regression\s+analysis|sensitivity\s+analysis)",
-        text, re.IGNORECASE
-    ))
+    # USPAP adjustment support
+    adj_support = bool(re.search(r"(paired\s+sales|market\s+support|contributory\s+value|extracted\s+from\s+sales)", text, re.IGNORECASE))
     if not adj_support:
         flags_cnt += 1
 
@@ -760,17 +734,19 @@ def compose_output_analyst(md: Dict[str, str], text: str, pages: List[str], req_
         lines.append(_with_evidence(f"Value Conclusion: {md['value_conclusion']}", pages_evidence.get("value", "")))
     if md.get("effective_date"):
         lines.append(_with_evidence(f"Effective Date: {md['effective_date']}", pages_evidence.get("effective_date", "")))
-    if md.get("inspection_date"):
-        lines.append(_with_evidence(f"Inspection Date: {md['inspection_date']}", pages_evidence.get("inspection_date", "")))
     if md.get("form_type"):
         lines.append(f"Form Type: {md['form_type']}")
     if md.get("rights_appraised"):
         lines.append(_with_evidence(f"Rights Appraised: {md['rights_appraised']}", pages_evidence.get("rights", "")))
-    lines.append(f"Client / Lender: {md.get('client') or 'N/A'}")
+    client_line = md.get("client") or "N/A"
+    lines.append(f"Client / Lender: {client_line}")
     if md.get("intended_use"):
         lines.append(_with_evidence(f"Intended Use: {md['intended_use']}", pages_evidence.get("intended_use", "")))
-    if md.get("va_case_number"):
-        lines.append(_with_evidence(f"VA Case Number: {md['va_case_number']}", pages_evidence.get("va_case", "")))
+    if md.get("is_va_loan") == "Yes":
+        if md.get("va_case_number"):
+            lines.append(_with_evidence(f"VA Case Number: {md['va_case_number']}", pages_evidence.get("va_case", "")))
+        else:
+            lines.append("VA indicators present; VA case number not found.")
     lines.append("")
 
     # ------- Internal Consistency -------
@@ -827,7 +803,7 @@ def compose_output_analyst(md: Dict[str, str], text: str, pages: List[str], req_
             try:
                 if float(g) >= 25.0:
                     risky.append((i, g))
-            except:
+            except Exception:
                 pass
     if risky:
         cnum, gv = risky[0]
@@ -864,7 +840,7 @@ def compose_output_analyst(md: Dict[str, str], text: str, pages: List[str], req_
     lines.append(f"Adjusted Value Range: {comp_summary['adj_range'] or 'N/A'}")
     lines.append(f"Sale Date Range: {comp_summary['sale_date_range'] or 'N/A'}")
     lines.append("")
-    lines.append(f"— Engine v{ENGINE_VERSION} • req:{req_id} • src:{source_used}")
+    lines.append(f"— Engine v{ENGINE_VERSION} • req:{req_id}")
     return "\n".join(lines)
 
 # ----------------------------
@@ -878,7 +854,7 @@ def run_audit(file_obj, style_override: Optional[str] = None) -> str:
     except Exception:
         req_id = "req"
 
-    text, raw, source_used = extract_text_with_azure(file_obj)
+    text, raw = extract_text_with_azure(file_obj)
     md = extract_metadata(text)
     try:
         md["file_name"] = getattr(file_obj, "filename", "") or "[Not found in file]"
@@ -894,4 +870,4 @@ def run_audit(file_obj, style_override: Optional[str] = None) -> str:
     if style == "v27":
         return compose_output_v27(md, flags)
     else:
-        return compose_output_analyst(md, text, pages, req_id, source_used)
+        return compose_output_analyst(md, text, pages, req_id)
