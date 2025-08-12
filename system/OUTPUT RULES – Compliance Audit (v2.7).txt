@@ -1,31 +1,221 @@
-OUTPUT RULES – Compliance Audit (v2.7)
+OUTPUT RULES – Compliance Audit (v2.9)
 
 FORMAT:
-- Output must be plain text only.
-- Exactly five labeled sections, in this order:
-  [SECTION 1] REPORT METADATA SNAPSHOT
-  [SECTION 2] SUMMARY OF COMPLIANCE FLAGS
-  [SECTION 3] DETAILED FLAGS AND REFERENCES
-  [SECTION 4] TOP FLAGS (CONDENSED)
-  [SECTION 5] ADDITIONAL NOTES
-- No markdown, bullets other than "→", emojis, or styling.
 
-MANDATORY FLAGS TO CHECK:
-- 1004MC (Market Conditions Addendum) presence.
-- VA MPR references when a VA loan is indicated.
-- Signature/date basic consistency.
+Output must be plain text only.
 
-CONTENT RULES:
-- SECTION 1 lists key metadata: file name, effective date, form type, appraiser name, intended use/client, VA indicator.
-- SECTION 2 prints one line per high-level flag.
-- SECTION 3 mirrors flags from Section 2 for clarity; future versions may include specific citations.
-- SECTION 4 includes the top (up to three) flags only.
-- SECTION 5 allows brief operational notes (3 lines max). No AI commentary or marketing language.
+Exactly five labeled sections, in this order:
+[SECTION 1] REPORT METADATA SNAPSHOT
+[SECTION 2] SUMMARY OF COMPLIANCE FLAGS
+[SECTION 3] DETAILED FLAGS AND REFERENCES
+[SECTION 4] TOP FLAGS (CONDENSED)
+[SECTION 5] ADDITIONAL NOTES
 
-PROHIBITIONS:
-- No internal rule thresholds, prompts, or system metadata in outputs.
-- No tables, HTML, markdown, or code fences.
-- No long explanations or hypotheticals.
+No markdown, no tables, no HTML, no code fences.
+
+Bullet/indicator style must be "→" only.
+
+No internal engine IDs, request IDs, version tags, thresholds, or prompts in the output.
+
+GLOBAL PRINCIPLES:
+
+Evidence-first: No confirmed statement may appear unless underlying field values are present and at least one evidence pointer (page + snippet) exists.
+
+Neutrality & Fair Housing: Language must remain objective and free of demographic characterizations or preference/limitation statements. Any detected non-compliant phrasing must be flagged, not reproduced.
+
+Redaction: Evidence snippets must redact borrower PII and any protected-class terms using "[…]".
+
+Severity ordering: Flags listed by severity → (1) USPAP/legal (including Fair Housing/HUD/FHA/VA/State), (2) GSE/agency, (3) internal consistency/quality.
+
+Data normalization: Dates → "MMM DD, YYYY"; currency → "$###,###"; ranges → "A–B" with en dash; addresses/title case where possible.
+
+Consistency guard: If a field is "[Not found]" in Section 1, no later section may assert that field is "consistent" or "confirmed" — downgrade to ℹ️ informational.
+
+MANDATORY CHECKS (MINIMUM SET):
+
+1004MC (Market Conditions Addendum) presence when applicable.
+
+VA MPR references when VA loan indicators are present.
+
+FHA/HUD indicators and required exhibits/certifications when FHA loan indicators are present.
+
+Signature and date basics (name matches header, license number, state, date signed).
+
+Highest & Best Use: statement and support both present.
+
+Subject address extraction and basic cross-page consistency.
+
+Loan-type detection (VA/FHA/Conventional/USDA) from any page.
+
+State hooks: run state-specific mini-checklist when state is identified (flood/septic/solar/radon disclosures).
+
+Form-type to property-type validation (e.g., 1025 requires multi-family; 1004C requires manufactured home data).
+
+Subject-to condition handling (repairs/completion without supporting addenda).
+
+Scope of work consistency check (declared vs actual approaches developed).
+
+Market trend quantifier check (trend claims require statistical support).
+
+Value reconciliation reasoning present and tied to adjusted range.
+
+SECTION 1 — REPORT METADATA SNAPSHOT:
+
+Lines (in this order; output "[Not found]" when unknown):
+→ File Name = <value or [Not found]>
+→ Effective Date = <MMM DD, YYYY or [Not found]>
+→ Form Type = <e.g., 1004/URAR or [Not found]>
+→ Appraiser Name = <value or [Not found]>
+→ Intended Use / Client = <value or [Not found]>
+→ Loan Type = <VA / FHA / Conventional / USDA or [Not found]>
+→ Is VA Loan = <Yes/No/[Not found]>
+
+Evidence allowed here only for Effective Date and Form Type:
+(Evidence: p.X: "<snippet>") — snippet ≤15 words, redacted as required.
+
+SECTION 2 — SUMMARY OF COMPLIANCE FLAGS:
+
+One line per high-level flag, ordered by severity then impact.
+
+Each line begins with:
+→ [CRITICAL] <issue>
+→ [MODERATE] <issue>
+→ [MINOR] <issue>
+
+Examples:
+
+Missing 1004MC when applicable.
+
+VA MPR references missing in VA context.
+
+FHA exhibit/certification missing in FHA context.
+
+H&BU statement/support not found.
+
+Signature or credential element missing.
+
+Subject address not extracted; consistency cannot be tested.
+
+Potential Fair Housing language detected.
+
+Inconsistent extraction for critical field(s).
+
+Market trend stated without supporting data.
+
+Form type/property type mismatch.
+
+Scope of work contradiction.
+
+SECTION 3 — DETAILED FLAGS AND REFERENCES:
+
+Mirrors Section 2 with concise detail and evidence pointer when available.
+
+Format:
+→ <issue>: <brief detail>. (Evidence: p.X: "<snippet>")
+
+Evidence rules:
+
+Must include page number when citing text.
+
+Snippet ≤15 words; redact PII and protected-class terms.
+
+If no source (e.g., missing form), omit Evidence.
+
+Double-extraction mismatch format:
+→ Inconsistent Effective Date: "Jun 30, 2025" vs "Jul 02, 2025". (Evidence: p.2 / p.3)
+
+SECTION 4 — TOP FLAGS (CONDENSED):
+
+Up to three items, chosen by severity and frequency.
+
+Format:
+→ <issue>
+
+No evidence or detail.
+
+SECTION 5 — ADDITIONAL NOTES:
+
+Max 3 lines.
+
+Allowed:
+
+Operational notes (e.g., "Inspection date not found; cannot compare to effective date.").
+
+Data gap notices with severity tags.
+
+Final disclaimer (must be last line):
+→ Automated audit. Use professional judgment when making final report decisions.
+
+Prohibited:
+
+Marketing language, AI self-references, internal commentary.
+
+FAIR HOUSING / MODERATION RULES:
+
+Do not reproduce or endorse language referencing protected classes or implying preferences/limitations.
+
+Flag such content as:
+→ Potential Fair Housing concern detected in narrative. Please revise to neutral, fact-based language.
+
+Replace protected terms in evidence snippets with "[…]".
+
+Flag vague neighborhood descriptors unless paired with objective data.
+
+EVIDENCE & CONFIRMATION GATES:
+
+Confirmed claims require:
+
+Field values for subject and, where relevant, ≥2 comparables.
+
+At least one evidence pointer with page number.
+
+No contradictory data from cross-check.
+
+Otherwise downgrade to:
+→ Not enough data to confirm <topic>.
+
+CONSISTENCY & DOWNGRADE RULE:
+
+Integrity pass after Sections 1–3: downgrade any "confirmed" statements that conflict with Section 1 findings.
+
+Remove all internal identifiers before output.
+
+DATA NORMALIZATION:
+
+Dates → "MMM DD, YYYY"
+
+Currency → "$###,###"
+
+Ranges → "A–B" (en dash)
+
+Addresses → normalized casing
+
+Distances/DOM ranges only if ≥2 values; otherwise omit.
 
 ERROR HANDLING:
-- If an unrecoverable error occurs, return status 500 with a short plain-text message starting with "Audit failed:".
+
+Unrecoverable error → HTTP 500 + short plain-text message starting with "Audit failed:"
+
+No stack traces, no metadata in output.
+
+Change summary from v2.8 → v2.9:
+
+Added loan-type conditional rules for Conventional/GSE and USDA.
+
+Added flag weighting logic for Top Flags by severity + frequency.
+
+Added duplicate form/exhibit detection.
+
+Expanded state hooks to include radon disclosures.
+
+Added borrower/client masking for public outputs.
+
+Added form-type vs property-type validation.
+
+Added subject-to handling rules.
+
+Added scope of work consistency check.
+
+Added market trend quantifier check.
+
+Added value reconciliation reasoning requirement.
