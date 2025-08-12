@@ -1,17 +1,21 @@
 """
-app.py — Compliance Audit API (v6.6-compatible, minimal)
+app.py — Compliance Audit API (v6.6, with /audit and /audit_url)
 
-Implements the public HTTP interface described in the SYSTEM EXECUTION SCHEMATIC v6.6:
-- POST /audit  -> returns text/plain five-section audit
-- GET  /health -> liveness
-- GET  /ready  -> readiness (Azure reachable + rules/schematic present)
-- GET  /version-> versions only
+Endpoints
+- POST /audit      : multipart/form-data ({ file }) -> text/plain audit
+- POST /audit_url  : JSON { url } -> text/plain audit (downloads PDF)
+- GET  /health     : liveness
+- GET  /ready      : readiness (Azure reachable + rules/schematic present)
+- GET  /version    : versions only
+- GET  /           : tiny banner (optional)
 
-Behavioral notes:
-- Always return text/plain for /audit body; never JSON.
-- Add headers: X-Rules-Version, X-Schematic-Version, X-Output-Mode on success.
+Notes
+- Always return text/plain for /audit and /audit_url bodies (never JSON).
+- Adds headers: X-Rules-Version, X-Schematic-Version, X-Output-Mode on success.
 - No persistence; request-scoped processing.
-- Enforces basic rate limiting per IP (best-effort, in-memory).
+- Simple per-IP rate limit (in-memory).
+- Run with ASGI worker:
+  gunicorn -k uvicorn.workers.UvicornWorker app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
 """
 from __future__ import annotations
 
@@ -20,13 +24,21 @@ import time
 import io
 from typing import Dict
 
-from fastapi import FastAPI, File, UploadFile, Response, HTTPException, Request
+from fastapi import FastAPI, File, UploadFile, Response, HTTPException, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import PlainTextResponse, JSONResponse
 from pypdf import PdfReader
+import requests
 
 # Engine (rule-locked logic)
-from engine.__init__ import run_audit, OUTPUT_RULES_PATH, SCHEMATIC_PATH, PUBLIC_MODE, MAX_MB, MAX_PAGES
+from engine.__init__ import (
+    run_audit,
+    OUTPUT_RULES_PATH,
+    SCHEMATIC_PATH,
+    PUBLIC_MODE,
+    MAX_MB,
+    MAX_PAGES,
+)
 
 # -----------------------------
 # App setup
@@ -69,8 +81,13 @@ def _short_fail(msg: str, status: int = 500) -> PlainTextResponse:
 
 
 # -----------------------------
-# Endpoints
+# Routes
 # -----------------------------
+@app.get("/")
+async def root() -> JSONResponse:
+    return JSONResponse({"status": "ok", "service": "Compliance Audit API", "schematic": SCHEMATIC_VERSION})
+
+
 @app.get("/health")
 async def health() -> JSONResponse:
     return JSONResponse({"status": "ok"})
@@ -78,12 +95,15 @@ async def health() -> JSONResponse:
 
 @app.get("/ready")
 async def ready() -> JSONResponse:
-    # Check rules & schematic existence; do not leak paths
     rules_ok = os.path.exists(OUTPUT_RULES_PATH)
     schematic_ok = os.path.exists(SCHEMATIC_PATH)
     azure_ok = bool(os.getenv("AZURE_FORMRECOGNIZER_ENDPOINT") and os.getenv("AZURE_FORMRECOGNIZER_KEY"))
     status = "ready" if (rules_ok and schematic_ok and azure_ok) else "not_ready"
-    return JSONResponse({"status": status, "rules": RULES_VERSION if rules_ok else None, "schematic": SCHEMATIC_VERSION if schematic_ok else None})
+    return JSONResponse({
+        "status": status,
+        "rules": RULES_VERSION if rules_ok else None,
+        "schematic": SCHEMATIC_VERSION if schematic_ok else None,
+    })
 
 
 @app.get("/version")
@@ -137,7 +157,6 @@ async def audit(request: Request, file: UploadFile = File(...)) -> Response:
     try:
         text = run_audit(data)
     except RuntimeError as e:
-        # Ensure we only return the short text and not internals
         msg = str(e)
         if not msg.startswith("Audit failed:"):
             msg = "Audit failed: processing error"
@@ -145,7 +164,6 @@ async def audit(request: Request, file: UploadFile = File(...)) -> Response:
     except Exception:
         return _short_fail("processing error", status=500)
 
-    # Success
     headers = {
         "X-Rules-Version": RULES_VERSION,
         "X-Schematic-Version": SCHEMATIC_VERSION,
@@ -155,7 +173,50 @@ async def audit(request: Request, file: UploadFile = File(...)) -> Response:
     return Response(content=text, media_type="text/plain; charset=utf-8", headers=headers)
 
 
-# Optional: run with `python app.py`
+@app.post("/audit_url")
+async def audit_url(request: Request, payload: dict = Body(...)) -> Response:
+    """Accepts JSON {"url": "https://...pdf"} and fetches the PDF, then runs the audit."""
+    # Rate limit
+    client_ip = request.client.host if request.client else "unknown"
+    if _rate_limited(client_ip):
+        return _short_fail("rate limit exceeded", status=429)
+
+    url = (payload or {}).get("url")
+    if not url:
+        return _short_fail("missing 'url' in JSON body", status=400)
+
+    try:
+        r = requests.get(url, timeout=20)
+    except Exception:
+        return _short_fail("could not fetch the URL", status=400)
+
+    if r.status_code != 200:
+        return _short_fail("non-200 response from URL", status=400)
+
+    data = r.content or b""
+    if not data.startswith(b"%PDF"):
+        return _short_fail("URL did not return a PDF", status=400)
+
+    try:
+        text = run_audit(data)
+    except RuntimeError as e:
+        msg = str(e)
+        if not msg.startswith("Audit failed:"):
+            msg = "Audit failed: processing error"
+        return PlainTextResponse(msg, status_code=500, media_type="text/plain; charset=utf-8")
+    except Exception:
+        return _short_fail("processing error", status=500)
+
+    headers = {
+        "X-Rules-Version": RULES_VERSION,
+        "X-Schematic-Version": SCHEMATIC_VERSION,
+        "X-Output-Mode": "public" if PUBLIC_MODE else "private",
+        "Content-Type": "text/plain; charset=utf-8",
+    }
+    return Response(content=text, media_type="text/plain; charset=utf-8", headers=headers)
+
+
+# Optional: run locally with `python app.py`
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
