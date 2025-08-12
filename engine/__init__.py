@@ -1,8 +1,9 @@
 """
-engine/__init__.py — Compliance Audit engine (v6.9.1)
+engine/__init__.py — Compliance Audit engine (v6.9.2)
 - Azure DI → OpenAI (if key present) → five-section text/plain.
-- Tolerant filename resolver for system files (handles '-' vs '–' dashes).
+- Tolerant filename resolver for system files (handles '-' vs '–' dashes and underscores).
 - Accepts OPENAI_API_KEY or OPEN_API_KEY.
+- Timeouts for Azure/OpenAI; guards for empty LLM output.
 - Always returns the same five-section shape (with emojis) even on errors.
 """
 from __future__ import annotations
@@ -38,6 +39,9 @@ AZURE_FALLBACK_PDF_TEXT = os.getenv("AZURE_FALLBACK_PDF_TEXT", "true").strip().l
 OPENAI_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("OPEN_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
+# Limit text sent to the model (characters)
+MAX_MODEL_CHARS = int(os.getenv("MAX_MODEL_CHARS", "500000"))
+
 FLAG_EMOJI = {"CRITICAL": "🔴", "MODERATE": "🟠", "MINOR": "🔵", "DATA GAP": "🟡", "PASS": "🟢"}
 FLAG_SYNONYMS = {"MAJOR": "CRITICAL", "WARNING": "MODERATE", "INFO": "MINOR", "NOTE": "MINOR", "GAP": "DATA GAP", "OK": "PASS"}
 LABEL_PATTERN = re.compile(r"\[(?P<label>[A-Z ]+?)\]")
@@ -52,7 +56,7 @@ SECTION_HEADERS = [
 
 # ---------- public entry ----------
 def run_audit(data_or_filelike: Any) -> str:
-    # Resolve files robustly (dash-agnostic, case-insensitive)
+    # Resolve files robustly (dash-agnostic, underscores, case-insensitive)
     schematic_path = _resolve_system_file(SCHEMATIC_CANON)
     rules_path = _resolve_system_file(RULES_CANON)
 
@@ -75,7 +79,9 @@ def run_audit(data_or_filelike: Any) -> str:
     except Exception:
         return _render_error("Invalid input", "Could not read uploaded file bytes.")
 
-    if not pdf_bytes or not pdf_bytes.startswith(b"%PDF"):
+    # PDF signature tolerance: allow small leading noise
+    head = (pdf_bytes or b"")[:10]
+    if b"%PDF" not in head:
         return _render_error("Unsupported file type", "Only PDF files are supported.")
     if len(pdf_bytes) > MAX_MB * 1024 * 1024:
         return _render_error("File too large", f"File exceeds {MAX_MB} MB limit.")
@@ -91,6 +97,7 @@ def run_audit(data_or_filelike: Any) -> str:
         if "/Names" in catalog and getattr(catalog["/Names"], "get", lambda *_: None)("/EmbeddedFiles"):
             return _render_error("Blocked content", "PDF contains embedded files.")
     except Exception:
+        # keep going; we'll rely on Azure extraction and downstream guards
         pass
 
     # Azure extraction
@@ -117,13 +124,16 @@ def run_audit(data_or_filelike: Any) -> str:
             user_prompt = (
                 "Produce the compliance audit for the following appraisal report text.\n"
                 "Return ONLY the five-section plain-text output per the rules.\n"
-                "<<REPORT_TEXT_BEGIN>>\n" + full_text[:500_000] + "\n<<REPORT_TEXT_END>>"
+                "<<REPORT_TEXT_BEGIN>>\n" + full_text[:MAX_MODEL_CHARS] + "\n<<REPORT_TEXT_END>>"
             )
             output = _call_openai(system_prompt, user_prompt).strip()
+            if not output:
+                raise RuntimeError("LLM returned empty content")
             output = _enforce_minimum_shape(output)
             return _decorate_emojis(output)
         except Exception:
-            pass  # fall through
+            # LLM failure: fall through to deterministic fallback
+            pass
 
     # Fallback (still valid shape)
     return _decorate_emojis(_deterministic_fallback())
@@ -133,28 +143,25 @@ def _resolve_system_file(canon: str) -> str:
     """
     Return an existing path in /system matching the canonical name, but tolerant to:
     - ASCII '-' vs EN DASH '–'
+    - underscores vs spaces
     - variable whitespace
     - case differences
     """
     want = _normalize_filename(canon)
     candidates = [os.path.join(SYSTEM_DIR, canon)]
-    # scan all files once
     try:
         for name in os.listdir(SYSTEM_DIR):
             if _normalize_filename(name) == want:
                 candidates.append(os.path.join(SYSTEM_DIR, name))
     except Exception:
         pass
-    # pick the first that exists
     for p in candidates:
         if os.path.exists(p):
             return p
-    # fall back to canonical (will raise later and produce a readable error)
     return os.path.join(SYSTEM_DIR, canon)
 
 def _normalize_filename(s: str) -> str:
-    # normalize dashes, collapse spaces, lowercase
-    s2 = s.replace("–", "-").replace("—", "-")
+    s2 = s.replace("–", "-").replace("—", "-").replace("_", " ")
     s2 = re.sub(r"\s+", " ", s2).strip().lower()
     return s2
 
@@ -199,7 +206,8 @@ def _render_error(headline: str, detail: str) -> str:
     s3 = ["[SECTION 3] DETAILED FLAGS AND REFERENCES", f"→ {detail}"]
     s4 = ["[SECTION 4] TOP FLAGS (CONDENSED)", f"→ [CRITICAL] {headline}"]
     s5 = ["[SECTION 5] ADDITIONAL NOTES", "→ Automated audit. Use professional judgment when making final report decisions."]
-    return _decorate_emojis("\n".join(s1 + [""] + s2 + [""] + s3 + [""] + s4 + [""] + s5))
+    text = "\n".join(s1 + [""] + s2 + [""] + s3 + [""] + s4 + [""] + s5)
+    return _decorate_emojis(text)
 
 def _deterministic_fallback() -> str:
     s1 = [
@@ -216,7 +224,18 @@ def _deterministic_fallback() -> str:
     s3 = ["[SECTION 3] DETAILED FLAGS AND REFERENCES", "→ OpenAI unavailable or failed; returned minimal structured output."]
     s4 = ["[SECTION 4] TOP FLAGS (CONDENSED)", "→ [MODERATE] Minimal deterministic fallback in use"]
     s5 = ["[SECTION 5] ADDITIONAL NOTES", "→ Automated audit. Use professional judgment when making final report decisions."]
-    return "\n".join(s1 + [""] + s2 + [""] + s3 + [""] + s4 + [""] + s5))
+    return "\n".join(s1 + [""] + s2 + [""] + s3 + [""] + s4 + [""] + s5)
+
+def _enforce_minimum_shape(text: str) -> str:
+    """
+    Ensure all required section headers are present at least once.
+    If the model omitted any, append them (keeps output valid for callers).
+    """
+    t = (text or "").strip()
+    for h in SECTION_HEADERS:
+        if h not in t:
+            t += ("\n\n" + h)
+    return t
 
 # ---------- Azure ----------
 def _analyze_with_azure(pdf_bytes: bytes) -> Dict[str, Any]:
@@ -225,15 +244,17 @@ def _analyze_with_azure(pdf_bytes: bytes) -> Dict[str, Any]:
     try:
         client = DocumentAnalysisClient(AZURE_ENDPOINT, AzureKeyCredential(AZURE_KEY))
         poller = client.begin_analyze_document(model_id=AZURE_MODEL, document=pdf_bytes)
-        result = poller.result()
+        result = poller.result(timeout=90)  # timeout to avoid worker hangs
     except Exception as e:
         if AZURE_FALLBACK_PDF_TEXT:
             try:
                 reader = PdfReader(io.BytesIO(pdf_bytes))
                 text = ""
                 for p in reader.pages:
-                    try: text += " " + (p.extract_text() or "")
-                    except Exception: continue
+                    try:
+                        text += " " + (p.extract_text() or "")
+                    except Exception:
+                        continue
                 return {"full_text": text}
             except Exception:
                 pass
@@ -246,11 +267,13 @@ def _call_openai(system_prompt: str, user_prompt: str) -> str:
     # modern SDK
     try:
         from openai import OpenAI
-        client = OpenAI(api_key=OPENAI_KEY)
+        client = OpenAI(api_key=OPENAI_KEY, timeout=30)  # add client timeout
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
-            messages=[{"role": "system", "content": system_prompt},
-                      {"role": "user", "content": user_prompt}],
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
             temperature=0,
         )
         return resp.choices[0].message.content or ""
@@ -258,10 +281,16 @@ def _call_openai(system_prompt: str, user_prompt: str) -> str:
         # legacy fallback
         import openai  # type: ignore
         openai.api_key = OPENAI_KEY
+        try:
+            openai.timeout = 30  # best-effort timeout for legacy
+        except Exception:
+            pass
         resp = openai.ChatCompletion.create(
             model=OPENAI_MODEL,
-            messages=[{"role": "system", "content": system_prompt},
-                      {"role": "user", "content": user_prompt}],
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
             temperature=0,
         )
         return resp["choices"][0]["message"]["content"] or ""
