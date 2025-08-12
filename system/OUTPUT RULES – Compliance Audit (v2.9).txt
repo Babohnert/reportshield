@@ -1,74 +1,136 @@
-OUTPUT RULES – COMPLIANCE AUDIT (v2.9, emoji-enhanced)
+OUTPUT RULES – Compliance Audit (v2.9)
 
-GENERAL RULES
-1. Output must be plain text only (no HTML/markdown/tables).
-2. Use exactly five sections in this order:
-   [SECTION 1] REPORT METADATA SNAPSHOT
-   [SECTION 2] SUMMARY OF FINDINGS
-   [SECTION 3] DETAILED FINDINGS AND REFERENCES
-   [SECTION 4] KEY FINDINGS (CONDENSED)
-   [SECTION 5] ADDITIONAL NOTES
-3. Bullets use "→". Emojis are permitted as specified below.
-4. Severity ordering everywhere: CRITICAL first, then MODERATE, then MINOR.
-5. Dates format: "MMM DD, YYYY" (e.g., Jun 26, 2025).
-6. Evidence snippets must be brief (≤1 line).
+A. GENERAL
 
-EMOJI SYSTEM (APPLIES TO SECTIONS 2–4)
-- CRITICAL findings: prefix with "🔴 " directly before the severity tag.
-- MODERATE findings: prefix with "🟠 " directly before the severity tag.
-- MINOR findings: prefix with "🟢 " directly before the severity tag.
-- Section 4 items (condensed) do NOT include severity tags; prefix each line with "📌 ".
+Output MUST be plain text only. No markdown, no tables, no code blocks, no HTML.
 
-SECTION 1 — REPORT METADATA SNAPSHOT
-Order and format:
-→ File Name = <value>
-→ Effective Date = <value> (Evidence: p.X: "<snippet>")
-→ Form Type = <value> (Evidence: p.X: "<snippet>")
-→ Appraiser Name = <value>
-→ Intended Use / Client = <value>
-→ Loan Type = <value>
-→ Is VA Loan = <Yes|No>
-→ Value Conclusion = <value>    [include only if detected]
-Notes:
-- Redact names when public mode is enabled.
-- Keep evidence parenthetical short (page + minimal text).
+Output MUST contain exactly five sections, in this order, each starting on its own line with the exact header text:
+[SECTION 1] REPORT METADATA SNAPSHOT
+[SECTION 2] SUMMARY OF COMPLIANCE FLAGS
+[SECTION 3] DETAILED FLAGS AND REFERENCES
+[SECTION 4] TOP FLAGS (CONDENSED)
+[SECTION 5] ADDITIONAL NOTES
 
-SECTION 2 — SUMMARY OF FINDINGS
-Format (one line per finding, already ordered by severity):
-→ 🔴 [CRITICAL] <issue>
-→ 🟠 [MODERATE] <issue>
-→ 🟢 [MINOR] <issue>
-Use action-oriented wording (e.g., “Missing 1004MC when applicable”).
+Use a single blank line between sections. No trailing blank line at the end is required by callers but is acceptable.
 
-SECTION 3 — DETAILED FINDINGS AND REFERENCES
-Mirror each item from Section 2 using the same emoji+severity prefix.
-Append rule/code in square brackets at the end.
-Format:
-→ 🔴 [CRITICAL] <issue> [CODE]
-→ 🟠 [MODERATE] <issue> [CODE]
-→ 🟢 [MINOR] <issue> [CODE]
-If evidence is available, include in-line after the issue:
-   (Evidence: p.X: "<snippet>")
+Use the arrow bullet “→ ” (arrow + space) at the beginning of each non-header line in Sections 1–4, and within Section 5 when listing notes.
 
-SECTION 4 — KEY FINDINGS (CONDENSED)
-List up to three most severe issues, no severity tags, each prefixed with 📌 :
-→ 📌 <issue>
-→ 📌 <issue>
-→ 📌 <issue>
+Do not include system metadata, thresholds, prompts, stack traces, or internal file paths.
 
-SECTION 5 — ADDITIONAL NOTES
-Always include first:
-→ 📝 Automated compliance audit. Use professional judgment for final decisions.
-Conditional adds (max total lines in this section = 3):
-- If VA Loan = Yes AND VA evidence missing:
-  → VA appraisal reports must reference Minimum Property Requirements when applicable.
-- If any “[Not found]”/missing values appear in Section 1:
-  → Certain metadata fields were not present in the uploaded report.
+B. EMOJI VISUAL CUES
 
-PROHIBITIONS
-- No internal thresholds, prompts, paths, or environment details in output.
-- No HTML, tables, or markdown styling beyond the specified emojis and arrows.
-- Do not exceed the five-section structure.
+Purpose: improve scan-ability without altering content.
 
-ERROR HANDLING
-- On unrecoverable error, return HTTP 500 with a short plain-text message starting with “Audit failed:”.
+Allowed labels and emojis:
+[CRITICAL]  -> 🔴
+[MODERATE]  -> 🟠
+[MINOR]     -> 🔵
+(Supported if emitted by upstream) [DATA GAP] -> 🟡 ; [PASS] -> 🟢
+
+Placement rules:
+a) Emojis appear only on lines that contain a bracketed label.
+b) Exactly one emoji per line, placed at the very start, then a single space, then the original line content (e.g., “🔴 → [CRITICAL] …”).
+c) Section headers never receive emojis.
+d) No other emoji usage is permitted anywhere in the output.
+
+Normalization: if synonyms appear (e.g., [WARNING] for MODERATE; [INFO]/[NOTE] for MINOR), normalize to the canonical set before emoji application.
+
+C. SECTION DEFINITIONS
+[SECTION 1] REPORT METADATA SNAPSHOT
+
+Provide core metadata derived from the report in arrow-bulleted lines. Use placeholders where unknown.
+→ File Name = <text or [Not found]>
+→ Effective Date = <Mon DD, YYYY or [Not found]> (Evidence: p.X: "snippet") when available
+→ Form Type = <code or [Not found]> (Evidence: p.X: "snippet") when available
+→ Appraiser Name = <[Redacted] in public mode, otherwise value or [Not found]>
+→ Intended Use / Client = <[Redacted] in public mode, otherwise value or [Not found]>
+→ Loan Type = <VA/FHA/USDA/Conventional or [Not found]>
+→ Is VA Loan = <Yes/No/[Not found]>
+→ Value Conclusion = <$###,###.##> when available
+
+[SECTION 2] SUMMARY OF COMPLIANCE FLAGS
+
+List each flag as a single concise line, one bullet per flag.
+
+Each line begins with a bracketed severity label: [CRITICAL], [MODERATE], or [MINOR].
+
+Do not add explanations here beyond the one-line issue text.
+
+[SECTION 3] DETAILED FLAGS AND REFERENCES
+
+For each flag in Section 2, add one bullet with a short explanation and, when available, an evidence parenthetical in the form: (Evidence: p.X: "snippet").
+
+If a rule id exists, append it at the end in square brackets, e.g., [VA-01].
+
+Redact sensitive terms and PII inside snippets as configured. Do not alter the issue statement.
+
+[SECTION 4] TOP FLAGS (CONDENSED)
+
+Include only the highest-severity items (generally up to three). No extra commentary.
+
+Each line reproduces the issue text only; keep the bracketed label when present.
+
+[SECTION 5] ADDITIONAL NOTES
+
+Include the following advisory lines exactly, in this order (use arrow bullets):
+→ Automated audit. Use professional judgment when making final report decisions.
+
+Optional additional notes may be added by the engine (e.g., when Effective Date is not found) but must remain concise, one bullet per line, and contain no emojis.
+
+D. REQUIRED CHECKS (MINIMUM SET)
+
+VA MPR references present when VA context is detected; if absent, flag as [CRITICAL].
+
+FHA exhibit/certification when FHA context is detected; if absent, flag as [CRITICAL].
+
+1004MC presence/market conditions addendum for 1004/URAR contexts; if missing, flag as [MODERATE].
+
+Highest & Best Use statement present; if not detected, flag as [MODERATE].
+
+Subject Address extractable; if not, flag as [MINOR].
+
+Reconciliation mentions an adjusted range or similar; if not, flag as [MINOR].
+
+Fair Housing narrative scan with exclusions; if potential concern remains, flag as [MODERATE].
+
+Optional per-state disclosure patterns via state hooks JSON; if missing, flag at declared severity.
+
+E. INTEGRITY FLAGS
+
+If KV vs text values disagree for Effective Date, add an integrity note:
+
+Section 2: → [MODERATE] Inconsistent extraction for critical field(s)
+
+Section 3: one explanatory line identifying both values and generic evidence indices.
+
+Section 4: include a condensed top-flag line: → Inconsistent Effective Date
+
+If KV vs text values disagree for Value Conclusion, mirror the pattern above and use: → Inconsistent Value Conclusion in Section 4.
+
+F. EMOJI APPLICATION ORDER
+
+Compose all five sections first, then apply emoji decoration.
+
+Do not alter or reflow text during emoji application apart from prepending the emoji and a single space to eligible lines.
+
+G. CONSISTENCY & CLEANUP
+
+Collapse any duplicate flags to a single entry in Section 2 (highest-severity phrasing), but retain detailed explanation once in Section 3.
+
+Keep one blank line between sections; avoid multiple consecutive blank lines elsewhere.
+
+Use “[Not found]” for unknowns and “[Redacted]” when public mode masks names.
+
+Never expose internal thresholds, prompts, model names beyond the required document version strings.
+
+H. ERROR OUTPUT FORMAT
+
+Maintain the five-section structure even on failure.
+
+Section 2 must include a single concise line labeled [CRITICAL] describing the error (e.g., engine configuration error, extraction error, file too large).
+
+Section 3 must include one explanatory bullet. Do not include stack traces. Keep it user-readable.
+
+Section 4 must carry a condensed [CRITICAL] line matching Section 2’s headline.
+
+Section 5 must still include the standard advisory bullet.
