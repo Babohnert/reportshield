@@ -1,36 +1,74 @@
-OUTPUT RULES – Compliance Audit (v2.9)
+OUTPUT RULES – COMPLIANCE AUDIT (v2.9, emoji-enhanced)
 
-FORMAT:
-- Output must be plain text only.
-- Exactly five labeled sections, in this order:
-  [SECTION 1] REPORT METADATA SNAPSHOT
-  [SECTION 2] SUMMARY OF COMPLIANCE FLAGS
-  [SECTION 3] DETAILED FLAGS AND REFERENCES
-  [SECTION 4] TOP FLAGS (CONDENSED)
-  [SECTION 5] ADDITIONAL NOTES
-- No markdown, emojis, tables, or styling. Use "→" bullets only.
+GENERAL RULES
+1. Output must be plain text only (no HTML/markdown/tables).
+2. Use exactly five sections in this order:
+   [SECTION 1] REPORT METADATA SNAPSHOT
+   [SECTION 2] SUMMARY OF FINDINGS
+   [SECTION 3] DETAILED FINDINGS AND REFERENCES
+   [SECTION 4] KEY FINDINGS (CONDENSED)
+   [SECTION 5] ADDITIONAL NOTES
+3. Bullets use "→". Emojis are permitted as specified below.
+4. Severity ordering everywhere: CRITICAL first, then MODERATE, then MINOR.
+5. Dates format: "MMM DD, YYYY" (e.g., Jun 26, 2025).
+6. Evidence snippets must be brief (≤1 line).
 
-MANDATORY FLAGS TO CHECK:
-- 1004MC (Market Conditions Addendum) presence (any of: “1004MC”, “Form 1004MC”, “Market Conditions Addendum”, “Market Conditions (1004MC)”).
-- VA evidence when VA loan indicated (any of: “MPR”, “Minimum Property Requirements”, “Tidewater”, “Notice of Value”, “NOV”).
-- Signature/date basic consistency (effective date vs. inspection date if both present).
+EMOJI SYSTEM (APPLIES TO SECTIONS 2–4)
+- CRITICAL findings: prefix with "🔴 " directly before the severity tag.
+- MODERATE findings: prefix with "🟠 " directly before the severity tag.
+- MINOR findings: prefix with "🟢 " directly before the severity tag.
+- Section 4 items (condensed) do NOT include severity tags; prefix each line with "📌 ".
 
-CONTENT RULES:
-- SECTION 1 lists: file name, effective date (+ evidence), form type (+ evidence), appraiser name, intended use/client, loan type, VA indicator, and value conclusion if present.
-- SECTION 2: one line per high-level flag with severity.
-- SECTION 3: mirror SECTION 2 flags; include a short, redacted evidence snippet when available.
-- SECTION 4: include top up to three flags (no severities).
-- SECTION 5: up to three operational notes max; avoid editorial commentary.
+SECTION 1 — REPORT METADATA SNAPSHOT
+Order and format:
+→ File Name = <value>
+→ Effective Date = <value> (Evidence: p.X: "<snippet>")
+→ Form Type = <value> (Evidence: p.X: "<snippet>")
+→ Appraiser Name = <value>
+→ Intended Use / Client = <value>
+→ Loan Type = <value>
+→ Is VA Loan = <Yes|No>
+→ Value Conclusion = <value>    [include only if detected]
+Notes:
+- Redact names when public mode is enabled.
+- Keep evidence parenthetical short (page + minimal text).
 
-PROHIBITIONS:
-- No internal thresholds, prompts, or system metadata.
-- No references to paths, env vars, or version control.
-- No HTML, markdown, or code blocks in outputs.
+SECTION 2 — SUMMARY OF FINDINGS
+Format (one line per finding, already ordered by severity):
+→ 🔴 [CRITICAL] <issue>
+→ 🟠 [MODERATE] <issue>
+→ 🟢 [MINOR] <issue>
+Use action-oriented wording (e.g., “Missing 1004MC when applicable”).
 
-FAIR HOUSING MODERATION:
-- Flag when core terms appear in narrative.
-- Do not flag when exclusion phrases apply (e.g., “family room”, neutral crime statistics references).
-- Redact sensitive terms in evidence snippets.
+SECTION 3 — DETAILED FINDINGS AND REFERENCES
+Mirror each item from Section 2 using the same emoji+severity prefix.
+Append rule/code in square brackets at the end.
+Format:
+→ 🔴 [CRITICAL] <issue> [CODE]
+→ 🟠 [MODERATE] <issue> [CODE]
+→ 🟢 [MINOR] <issue> [CODE]
+If evidence is available, include in-line after the issue:
+   (Evidence: p.X: "<snippet>")
 
-ERROR HANDLING:
-- If an unrecoverable error occurs, the API must return HTTP 500 with a short plain-text message starting with “Audit failed:”.
+SECTION 4 — KEY FINDINGS (CONDENSED)
+List up to three most severe issues, no severity tags, each prefixed with 📌 :
+→ 📌 <issue>
+→ 📌 <issue>
+→ 📌 <issue>
+
+SECTION 5 — ADDITIONAL NOTES
+Always include first:
+→ 📝 Automated compliance audit. Use professional judgment for final decisions.
+Conditional adds (max total lines in this section = 3):
+- If VA Loan = Yes AND VA evidence missing:
+  → VA appraisal reports must reference Minimum Property Requirements when applicable.
+- If any “[Not found]”/missing values appear in Section 1:
+  → Certain metadata fields were not present in the uploaded report.
+
+PROHIBITIONS
+- No internal thresholds, prompts, paths, or environment details in output.
+- No HTML, tables, or markdown styling beyond the specified emojis and arrows.
+- Do not exceed the five-section structure.
+
+ERROR HANDLING
+- On unrecoverable error, return HTTP 500 with a short plain-text message starting with “Audit failed:”.
