@@ -1,51 +1,41 @@
-# Compliance Audit API (Final)
+# ReportShield Compliance Audit API (v6.7)
 
-A minimal, rule-locked API that analyzes appraisal PDFs with Azure Document Intelligence and produces a five-section, plain-text compliance audit suitable for Wix or any frontend.
+A minimal, rule-locked FastAPI service that ingests appraisal PDFs, runs Azure Document Intelligence
+(prebuilt-document) extraction, evaluates compliance checks, and returns a five-section **plain-text** audit.
+Errors also return the same five-section structure (no JSON).
 
-## 1) Quick Start (Local)
+## Endpoints
+- `GET /health` → "ok"
+- `POST /audit` → multipart upload (`file`) — returns **text/plain**
+- `POST /audit-by-url` → `{ "url": "<Wix media URL>", "name": "report.pdf" }` — returns **text/plain**
 
-```bash
-python -m venv .venv
-# Windows
-.\.venv\Scripts\activate
-# macOS/Linux
-source .venv/bin/activate
+## Required files (server-side)
+Place these in `/system` (filenames are fixed):
+- `SYSTEM EXECUTION SCHEMATIC – Compliance Audit (v6.6).txt`
+- `OUTPUT RULES – Compliance Audit (v2.9).txt`
+- Optional: `state-hooks.json`, `fair-housing.json`
 
-pip install -r requirements.txt
+## Environment
+Set these on Render (example values shown for clarity only):
+- `AZURE_FORMRECOGNIZER_ENDPOINT=https://<subdomain>.cognitiveservices.azure.com/`
+- `AZURE_FORMRECOGNIZER_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`
+- `PUBLIC_MODE=true`
+- `MAX_MB=25`
+- `AZURE_MODEL=prebuilt-document`
+- `AZURE_FALLBACK_PDF_TEXT=true`
+- (Build hint) `PIP_PREFER_BINARY=1`
 
-# Create .env in project root with:
-# AZURE_FORMRECOGNIZER_ENDPOINT=https://<your-subdomain>.cognitiveservices.azure.com/
-# AZURE_FORMRECOGNIZER_KEY=<your-key>
-# (OPENAI_API_KEY is optional)
-
-python app.py
-```
-
-Test in a separate terminal:
-
-```bash
-curl -X POST "http://127.0.0.1:5000/audit" -F "file=@/path/to/YourSample.pdf"
-```
-
-You should receive a five-section plain-text response.
-
-## 2) Environment Variables
-
-- `AZURE_FORMRECOGNIZER_ENDPOINT` – required
-- `AZURE_FORMRECOGNIZER_KEY` – required
-- `OPENAI_API_KEY` – optional (not used by the current rules engine)
-- `PORT` – optional (defaults to 5000)
-
-## 3) Deploy (Render example)
-
-- Add `Procfile` and `runtime.txt` (already included).
-- Use `web: waitress-serve --port=$PORT app:app` as the start command.
-- Set environment variables in Render dashboard.
+## Deploy on Render
+- **Start command** (also in `Procfile`):
+  ```
+  web: gunicorn -k uvicorn.workers.UvicornWorker -w 2 -t 120 app:app --bind 0.0.0.0:$PORT
+  ```
 - Health check: `GET /health`.
 
-## 4) Notes
+## Wix (Velo) snippet
+See `wix/velo-snippet.js`. Update `API_BASE` to your service URL (Render URL or custom domain).
 
-- The API does not persist uploads; files are read in-memory per request.
-- Output follows `OUTPUT RULES – Compliance Audit (v2.7)` exactly.
-- Execution flow per `SYSTEM EXECUTION SCHEMATIC – Compliance Audit (v5.9)`.
-- To add additional checks, extend `check_flags()` in `engine/__init__.py`.
+## Notes
+- Output is always **text/plain** five-section format — even on error.
+- The API never stores PDFs; it processes bytes in-memory per request.
+- CORS is configured for your domain and Wix editors/CDNs only.
