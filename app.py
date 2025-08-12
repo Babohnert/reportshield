@@ -3,21 +3,27 @@ import os
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import PlainTextResponse
-from engine import run_audit  # your v6.6 engine
+from engine import run_audit  # v6.6 engine entrypoint
 
 MAX_MB = int(os.getenv("MAX_MB", "25"))
 
-app = FastAPI()
+app = FastAPI(title="ReportShield API")
 
-# CORS: explicit sites + regex for Wix subdomains/CDNs
+# CORS: explicit origins + regex to cover Wix preview/editor/CDNs
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://reportshield.ai",
         "https://www.reportshield.ai",
-        # If you have a custom Wix domain (e.g., https://yourbrand.com), add it here too.
+        # If you have a custom live site domain, add it here too.
+        # e.g., "https://yourbrand.com",
     ],
-    allow_origin_regex=r"^https://([a-zA-Z0-9-]+\.)*(wixsite|editorx)\.com$|^https://([a-zA-Z0-9-]+\.)*(wixstatic|wixmp)\.com$",
+    allow_origin_regex=(
+        r"^https://([a-zA-Z0-9-]+\.)*(wixsite|editorx)\.com$"
+        r"|^https://([a-zA-Z0-9-]+\.)*(wixstatic|wixmp)\.com$"
+        r"|^https://editor\.wix\.com$"
+        r"|^https://create\.wix\.com$"
+    ),
     allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
     allow_headers=["*"],
 )
@@ -42,12 +48,13 @@ async def version():
 async def limits():
     return f"MAX_MB={MAX_MB}"
 
-# Optional: simple echo for debugging multipart from Wix
+# Optional: debug endpoint to confirm multipart from Wix
 @app.post("/echo", response_class=PlainTextResponse)
 async def echo(file: UploadFile = File(None)):
-    name = getattr(file, "filename", None) if file else None
-    size = len(await file.read()) if file else 0
-    return f"received file={bool(file)} name={name} size={size}"
+    if not file:
+        return "received file=False"
+    data = await file.read()
+    return f"received file=True name={file.filename} size={len(data)}"
 
 @app.post("/audit", response_class=PlainTextResponse)
 async def audit(file: UploadFile = File(...)):
@@ -57,9 +64,10 @@ async def audit(file: UploadFile = File(...)):
             raise HTTPException(status_code=400, detail="Please upload a PDF.")
         if len(data) > MAX_MB * 1024 * 1024:
             raise HTTPException(status_code=413, detail=f"File too large (>{MAX_MB} MB).")
-        result = run_audit(data)
-        return result  # plain text (UTF-8) with emojis
+        result = run_audit(data)  # returns plain text with emojis
+        return result
     except HTTPException:
         raise
     except Exception as e:
+        # Keep the error human-readable; the engine also formats errors if it raises
         raise HTTPException(status_code=500, detail=f"Audit failed: {e}")
