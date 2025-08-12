@@ -1,5 +1,5 @@
 """
-engine/__init__.py — Compliance Audit engine (v6.6-compatible, full-length)
+engine/__init__.py — Compliance Audit engine (v6.6-compatible, robust)
 
 Implements the deterministic execution pipeline defined in:
 - SYSTEM EXECUTION SCHEMATIC – Compliance Audit (v6.6)
@@ -11,7 +11,7 @@ Public API:
 Key properties:
 - Rule-locked: no generative tone; temperature must be 0 wherever LLMs are involved.
 - Azure Document Intelligence (prebuilt-document) for OCR/KV/tables.
-- Dynamic load + checksum verification of schematic/rules to prevent drift.
+- Dynamic, tolerant loading of schematic/rules filenames (handles hyphen vs en-dash; env overrides).
 - Evidence-first gating, Fair Housing moderation, PII redaction, integrity pass.
 - Public/private output modes with redaction behavior.
 - No persistence of user content; request-scoped processing only.
@@ -22,7 +22,6 @@ import io
 import os
 import re
 import json
-import hashlib
 import logging
 import calendar
 from dataclasses import dataclass, field
@@ -53,9 +52,38 @@ RULES_VERSION_REQUIRED = "v2.9"
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 SYSTEM_DIR = os.path.join(BASE_DIR, "system")
-OUTPUT_RULES_PATH = os.path.join(SYSTEM_DIR, "OUTPUT RULES – Compliance Audit (v2.9).txt")
-SCHEMATIC_PATH = os.path.join(SYSTEM_DIR, "SYSTEM EXECUTION SCHEMATIC – Compliance Audit (v6.6).txt")
-STATE_HOOKS_PATH = os.path.join(SYSTEM_DIR, "state-hooks.json")
+
+# Tolerant filename resolver (supports en-dash/hyphen and legacy versions). Also supports env overrides.
+RULES_FILE_ENV = os.getenv("OUTPUT_RULES_FILE")
+SCHEM_FILE_ENV = os.getenv("SCHEMATIC_FILE")
+
+RULES_CANDIDATES = [
+    "OUTPUT RULES – Compliance Audit (v2.9).txt",
+    "OUTPUT RULES - Compliance Audit (v2.9).txt",
+    "OUTPUT RULES – Compliance Audit.txt",
+    "OUTPUT RULES - Compliance Audit.txt",
+]
+SCHEM_CANDIDATES = [
+    "SYSTEM EXECUTION SCHEMATIC – Compliance Audit (v6.6).txt",
+    "SYSTEM EXECUTION SCHEMATIC - Compliance Audit (v6.6).txt",
+    "SYSTEM EXECUTION SCHEMATIC – Compliance Audit (v5.9).txt",
+    "SYSTEM EXECUTION SCHEMATIC - Compliance Audit (v5.9).txt",
+    "SYSTEM EXECUTION SCHEMATIC – Compliance Audit.txt",
+    "SYSTEM EXECUTION SCHEMATIC - Compliance Audit.txt",
+]
+
+def _first_existing(names: List[str]) -> Optional[str]:
+    for name in names:
+        p = os.path.join(SYSTEM_DIR, name)
+        if os.path.exists(p):
+            return p
+    return None
+
+OUTPUT_RULES_PATH = (os.path.join(SYSTEM_DIR, RULES_FILE_ENV)
+                     if RULES_FILE_ENV else _first_existing(RULES_CANDIDATES))
+SCHEMATIC_PATH    = (os.path.join(SYSTEM_DIR, SCHEM_FILE_ENV)
+                     if SCHEM_FILE_ENV else _first_existing(SCHEM_CANDIDATES))
+STATE_HOOKS_PATH  = os.path.join(SYSTEM_DIR, "state-hooks.json")
 
 PUBLIC_MODE = os.getenv("PUBLIC_MODE", "true").lower() == "true"
 MAX_MB = int(os.getenv("MAX_MB", "25"))
@@ -66,6 +94,7 @@ PII_REDACT = os.getenv("PII_REDACT", "true").lower() == "true"
 
 AZURE_ENDPOINT = os.getenv("AZURE_FORMRECOGNIZER_ENDPOINT")
 AZURE_KEY = os.getenv("AZURE_FORMRECOGNIZER_KEY")
+AZURE_FALLBACK_PDF_TEXT = os.getenv("AZURE_FALLBACK_PDF_TEXT", "true").lower() == "true"
 
 # -----------------------------
 # Regex patterns and markers
@@ -154,8 +183,8 @@ class ParsedDoc:
 # Helpers
 # -----------------------------
 
-def _load_text_file(path: str) -> str:
-    if not os.path.exists(path):
+def _load_text_file(path: Optional[str]) -> str:
+    if not path or not os.path.exists(path):
         raise RuntimeError("Audit failed: configuration error")
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
@@ -205,15 +234,31 @@ def _fmt_date_token(raw: str) -> Optional[str]:
     return None
 
 # -----------------------------
-# Azure extraction
+# Azure extraction (with clear errors + optional PDF text fallback)
 # -----------------------------
 
 def _analyze_with_azure(pdf_bytes: bytes) -> Dict[str, Any]:
     if not AZURE_ENDPOINT or not AZURE_KEY:
         raise RuntimeError("Audit failed: configuration error")
-    client = DocumentAnalysisClient(AZURE_ENDPOINT, AzureKeyCredential(AZURE_KEY))
-    poller = client.begin_analyze_document(model_id=AZURE_MODEL, document=pdf_bytes)
-    result = poller.result()
+    try:
+        client = DocumentAnalysisClient(AZURE_ENDPOINT, AzureKeyCredential(AZURE_KEY))
+        poller = client.begin_analyze_document(model_id=AZURE_MODEL, document=pdf_bytes)
+        result = poller.result()
+    except Exception as e:
+        if AZURE_FALLBACK_PDF_TEXT:
+            # best-effort: try plain PDF text so we can still render an audit
+            try:
+                reader = PdfReader(io.BytesIO(pdf_bytes))
+                text = ""
+                for p in reader.pages:
+                    try:
+                        text += " " + (p.extract_text() or "")
+                    except Exception:
+                        continue
+                return {"full_text": text, "pages": ["" for _ in range(len(reader.pages))], "kv": [], "tables": []}
+            except Exception:
+                pass
+        raise RuntimeError(f"Audit failed: extraction error ({e.__class__.__name__})")
 
     full_text = getattr(result, "content", "") or ""
 
@@ -313,7 +358,7 @@ def _extract_value_conclusion(text: str) -> ParsedField:
 
 
 def _extract_subject_address(kv: List[Dict[str, Any]], text: str) -> ParsedField:
-    pf = _kv_lookup(kv, ["Subject Address", "Property Address", "Street Address"])
+    pf = _kv_lookup(kv, ["Subject Address", "Property Address", "Street Address"])  # KV-first
     if pf and pf.value:
         return pf
     m = re.search(r"\d{1,6}\s+\w[\w\s\.']+,\s*\w+[\w\s']*,\s*[A-Z]{2}\s*\d{5}(-\d{4})?", text)
@@ -499,11 +544,13 @@ def _render_plain_text(sections: Dict[str, Any]) -> str:
 # -----------------------------
 
 def run_audit(file_like: Any) -> str:
+    # Load and validate rule-locked files
     rules_text = _load_text_file(OUTPUT_RULES_PATH)
     schematic_text = _load_text_file(SCHEMATIC_PATH)
     if RULES_VERSION_REQUIRED not in rules_text or SCHEMATIC_VERSION_REQUIRED not in schematic_text:
         raise RuntimeError("Audit failed: configuration error")
 
+    # Ingest bytes
     if hasattr(file_like, "read"):
         pdf_bytes = file_like.read()
         filename = getattr(file_like, "filename", None)
@@ -520,6 +567,7 @@ def run_audit(file_like: Any) -> str:
     if size_mb > MAX_MB:
         raise RuntimeError("Audit failed: file too large")
 
+    # Basic PDF hardening
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
         num_pages = len(reader.pages)
@@ -535,12 +583,14 @@ def run_audit(file_like: Any) -> str:
     except Exception:
         pass
 
+    # Extraction (Azure → optional fallback)
     analyzed = _analyze_with_azure(pdf_bytes)
     full_text = _normalize_ws(analyzed.get("full_text", ""))
     pages = analyzed.get("pages", []) or [""]
     kv = analyzed.get("kv", [])
     tables = analyzed.get("tables", [])
 
+    # Parse core metadata
     appraiser_pf = _kv_lookup(kv, ["Appraiser", "Signed By"]) or ParsedField(None, None)
     client_pf = _kv_lookup(kv, ["Client", "Lender"]) or ParsedField(None, None)
 
@@ -577,6 +627,7 @@ def run_audit(file_like: Any) -> str:
         comps=comps,
     )
 
+    # Optional state hooks
     state_hooks: Dict[str, Any] = {}
     if os.path.exists(STATE_HOOKS_PATH):
         try:
@@ -585,6 +636,7 @@ def run_audit(file_like: Any) -> str:
         except Exception:
             state_hooks = {}
 
+    # Apply rules and integrity notes
     sections = _apply_rules_v29(parsed, rules_text, state_hooks)
 
     if parsed.effective_mismatch:
