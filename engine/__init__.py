@@ -1,7 +1,7 @@
 import io
 import os
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -19,28 +19,29 @@ import fitz  # PyMuPDF
 AZURE_ENDPOINT = os.getenv("AZURE_FORMRECOGNIZER_ENDPOINT")
 AZURE_KEY = os.getenv("AZURE_FORMRECOGNIZER_KEY")
 
-# Feature toggles
-SHOW_VERBOSE_EVIDENCE = os.getenv("SHOW_VERBOSE_EVIDENCE", "1") not in ("0", "false", "False")
-USE_AZURE = os.getenv("USE_AZURE", "1") not in ("0", "false", "False")
-
 if not AZURE_ENDPOINT or not AZURE_KEY:
-    # Keep a clear message; app can still run with USE_AZURE=0
-    if USE_AZURE:
-        raise RuntimeError(
-            "Azure Form Recognizer endpoint/key not set. "
-            "Add AZURE_FORMRECOGNIZER_ENDPOINT and AZURE_FORMRECOGNIZER_KEY to your environment."
-        )
-
-doc_client = None
-if USE_AZURE:
-    doc_client = DocumentAnalysisClient(
-        endpoint=AZURE_ENDPOINT,
-        credential=AzureKeyCredential(AZURE_KEY)
+    raise RuntimeError(
+        "Azure Form Recognizer endpoint/key not set. "
+        "Add AZURE_FORMRECOGNIZER_ENDPOINT and AZURE_FORMRECOGNIZER_KEY to your .env"
     )
+
+doc_client = DocumentAnalysisClient(
+    endpoint=AZURE_ENDPOINT,
+    credential=AzureKeyCredential(AZURE_KEY)
+)
 
 SYSTEM_DIR = os.path.join(os.path.dirname(__file__), "..", "system")
 OUTPUT_STYLE = os.getenv("OUTPUT_STYLE", "analyst").lower()  # "analyst" (default) or "v27"
-ENGINE_VERSION = "1.5"
+
+ENGINE_VERSION = "1.6"
+
+# New toggles
+SHOW_VERBOSE_EVIDENCE = os.getenv("AUDIT_SHOW_EVIDENCE", "1") != "0"
+SHOW_FOOTER = os.getenv("AUDIT_SHOW_FOOTER", "1") != "0"
+
+DISCLAIMER_LINE = (
+    "⚠️ Automated audit. Use professional judgment when making final report decisions."
+)
 
 # ============================
 # Utility helpers
@@ -85,6 +86,8 @@ def _clean_sentence(s: str) -> str:
     # remove dangling determiners like "The." / "This."
     if re.fullmatch(r"(The|This|These|That)\.", s, flags=re.IGNORECASE):
         s = ""
+    # fix common half-sentence endings from OCR
+    s = re.sub(r"\bthat is the\b\.?$", "", s, flags=re.IGNORECASE).strip()
     if len(s) > 240:
         s = s[:240].rstrip()
     # end with period if it looks like a clause and not already ended
@@ -147,8 +150,8 @@ def find_evidence(pages: List[str], patterns: List[str]) -> str:
                 end = min(len(page), m.end() + 80)
                 snip = page[start:end]
                 snip = re.sub(r"\s+", " ", snip).strip()
-                if len(snip) > 160:
-                    snip = snip[:158] + "…"
+                if len(snip) > 140:
+                    snip = snip[:138] + "…"
                 return f"p.{i}: {snip}"
     return ""
 
@@ -182,11 +185,6 @@ def extract_text_with_azure(file_obj) -> Tuple[str, bytes]:
         except Exception:
             data = raw  # continue with original bytes
 
-    # Bypass Azure entirely if toggle is off
-    if not USE_AZURE or doc_client is None:
-        local = extract_text_with_pymupdf(raw)
-        return _normalize_text(local), raw
-
     try:
         # ---- Primary path: Azure DI ----
         poller = doc_client.begin_analyze_document("prebuilt-document", data)
@@ -219,9 +217,7 @@ def extract_text_with_azure(file_obj) -> Tuple[str, bytes]:
         fallback = extract_text_with_pymupdf(raw)
         if fallback:
             return _normalize_text(fallback), raw
-        # If even local extraction fails, surface a clean error
-        raise RuntimeError("Azure analysis failed and local text extraction also failed. "
-                           "Try a different or smaller PDF.")
+        raise RuntimeError("Azure analysis failed and local text extraction also failed. Try a different or smaller PDF.")
 
 # ============================
 # Parsing helpers + data extraction
@@ -232,33 +228,59 @@ FORM_KEYWORDS = [
     "GP RESIDENTIAL", "GP LAND", "GP CONDO", "GENERAL PURPOSE RESIDENTIAL"
 ]
 
+def _sanitize_party_name(s: str) -> str:
+    s = s.strip(" :;-|")
+    # Strip leading/ending label echoes like "Client", "Lender"
+    s = re.sub(r"^(Client|Lender)\s*:?[\s]*", "", s, flags=re.IGNORECASE).strip()
+    s = re.sub(r"\s{2,}", " ", s)
+    # Avoid common non-names
+    bads = [
+        "SUMMARY OF SALIENT FEATURES", "SUMMARY", "BORROWER", "CLIENT", "LENDER",
+        "Property Location", "Opinion of Value", "Prepared By"
+    ]
+    for b in bads:
+        if b.lower() in s.lower():
+            return ""
+    return s
+
 def _extract_client_lender(text: str) -> str:
     """
-    Target the 'Lender/Client' block specifically and avoid invoice-like or heading bleed.
+    Target the 'Lender/Client' block specifically and avoid invoice-like bleed.
+    Handles stacked label/value layouts and noisy echoes like 'Client:' on the next line.
     """
-    BAD_HEADINGS = r"(SUMMARY OF SALIENT FEATURES|SCOPE OF WORK|TABLE OF CONTENTS|TABLE\s+OF\s+CONTENTS)"
+    # 1) Stacked 'Borrower: ... Lender: ...' row
+    m = re.search(r"Borrower\s*:\s*[^\n]+\n?\s*Lender\s*:\s*([^\n]{2,160})", text, re.IGNORECASE)
+    if m:
+        cand = _sanitize_party_name(m.group(1))
+        if cand:
+            return cand
+
+    # 2) Inline 'Lender/Client: <value>'
     for pat in [
-        r"(?:Lender\s*/\s*Client|Client\s*/\s*Lender)\s*[:\-]?\s*([^\n]{2,120})",
-        r"\bClient\s*[:\-]\s*([^\n]{2,120})",
-        r"\bLender\s*[:\-]\s*([^\n]{2,120})",
+        r"(?:Lender\s*/\s*Client|Client\s*/\s*Lender)\s*[:\-]?\s*([^\n]{2,160})",
+        r"\bClient\s*[:\-]\s*([^\n]{2,160})",
+        r"\bLender\s*[:\-]\s*([^\n]{2,160})",
     ]:
         m = re.search(pat, text, re.IGNORECASE)
         if m:
-            cand = m.group(1).strip()
+            cand = _sanitize_party_name(m.group(1))
+            if cand:
+                return cand
+            # If the same line was just the label (e.g., 'Client:'), try the very next non-empty line
+            end = m.end()
+            tail = text[end:end+200]
+            for line in tail.splitlines():
+                line = _sanitize_party_name(line)
+                if line:
+                    return line
 
-            # Guard: skip obvious headings or billing fragments
-            if re.search(BAD_HEADINGS, cand, re.IGNORECASE):
-                continue
-            if re.search(r"Purchaser/Borrower|DESCRIPTION\s+FEES|TOTAL\s+DUE|Check\s+#", cand, re.IGNORECASE):
-                continue
-            # Skip shouty all-caps headings
-            if re.fullmatch(r"[A-Z\s/&\-\.,]{10,}", cand):
-                continue
+    # 3) Last-ditch: search for a prominent company-looking line that follows the word 'Lender' in 200 chars
+    m = re.search(r"Lender[^\n]{0,200}\n([^\n]{3,120})", text, re.IGNORECASE)
+    if m:
+        cand = _sanitize_party_name(m.group(1))
+        if cand:
+            return cand
 
-            # Trim at slashes or extra separators
-            cand = re.split(r"\s{2,}|\s/\s", cand)[0].strip()
-            cand = re.sub(r"\s{2,}", " ", cand).strip()
-            return cand if cand and cand.lower() != "case" else ""
     return ""
 
 def _extract_rights_appraised(text: str) -> str:
@@ -266,7 +288,7 @@ def _extract_rights_appraised(text: str) -> str:
     Choose a single rights selection, preferring a checked option near the Rights Appraised label.
     """
     block = ""
-    m = re.search(r"(Rights\s+Appraised|Property\s+Rights\s+Appraised)[^\n]{0,160}", text, re.IGNORECASE)
+    m = re.search(r"(Rights\s+Appraised|Property\s+Rights\s+Appraised)[^\n]{0,200}", text, re.IGNORECASE)
     if m:
         block = m.group(0)
 
@@ -298,19 +320,27 @@ def _extract_intended_use(text: str) -> str:
 
 def _extract_va_case(text: str) -> str:
     """
-    Pull VA case and normalize to 26-26-X-XXXXXXX (where X is alnum; middle char typically a letter).
-    Accept a variety of messy inputs.
+    Pull VA case and normalize to 26-26-X-XXXXXXX (third segment may be alnum).
+    Accepts a variety of messy inputs and longer tails.
     """
     cands = re.findall(
-        r"(?:VA\s*(?:Case|Loan)\s*(?:No\.?|Number)?:?\s*)?([26][\s-]?26[\s-]?[A-Za-z0-9][\s-]?[A-Za-z0-9]{7})",
+        r"(?:VA\s*(?:Case|Loan)\s*(?:No\.?|Number)?:?\s*)?(26[\s-]?26[\s-]?[A-Za-z0-9][\s-]?[A-Za-z0-9]{6,8})",
         text, re.IGNORECASE
     )
     for c in cands:
-        digits = re.sub(r"[^A-Za-z0-9]", "", c)
-        if len(digits) >= 12 and digits[:4] == "2626":
-            mid = (digits[4:5] or "X").upper()
-            tail = (digits[5:12] + "0"*7)[:7]
+        token = re.sub(r"[^A-Za-z0-9]", "", c)  # e.g., 26266XXXXXXX
+        if len(token) >= 11 and token.startswith("2626"):
+            mid = token[4:5].upper()
+            tail = token[5:12]  # keep first 7 of tail
+            tail = (tail + "0"*7)[:7]
             return f"26-26-{mid}-{tail}"
+    # Also catch explicit '26-26-' style anywhere
+    m2 = re.search(r"\b26[\s-]?26[\s-]?[A-Za-z0-9][\s-]?[A-Za-z0-9]{6,8}\b", text)
+    if m2:
+        token = re.sub(r"[^A-Za-z0-9]", "", m2.group(0))
+        mid = token[4:5].upper()
+        tail = (token[5:12] + "0"*7)[:7]
+        return f"26-26-{mid}-{tail}"
     return ""
 
 def extract_metadata(text: str) -> Dict[str, str]:
@@ -468,14 +498,14 @@ def parse_comps_quick(text: str) -> Dict[str, List[float]]:
     for m in re.findall(r"(?:Comp\s*#?\s*\d[^\n]{0,120}?(?:GLA(?:\s*\(sf\)|\s*\(sq\s*ft\)|\s*\(sqft\))?|Gross\s+Living\s+Area)[^\d]{0,10}([\d,]{3,}))", text, re.IGNORECASE):
         try:
             out["comp_gla"].append(float(m.replace(",", "")))
-        except Exception:
+        except:
             pass
 
     # distances: "miles" / "mi" (with optional bearings)
     for m in re.findall(r"\b([\d\.]+)\s*(?:miles|mi\.?)\b(?:\s*[NSEW]{1,2})?", text, re.IGNORECASE):
         try:
             out["miles"].append(float(m))
-        except Exception:
+        except:
             pass
 
     # DOM variants
@@ -483,7 +513,7 @@ def parse_comps_quick(text: str) -> Dict[str, List[float]]:
         num = m[0] or m[1]
         try:
             out["dom"].append(float(num))
-        except Exception:
+        except:
             pass
 
     return out
@@ -600,8 +630,7 @@ def gather_core_evidence(pages: List[str], md: Dict[str, str]) -> Dict[str, str]
         r"\bLender\s*[:\-]"
     ])
     out["intended_use"] = find_evidence(pages, [
-        r"INTENDED\s+USE\s*:",
-        r"The\s+intended\s+use"
+        r"INTENDED\s+USE\s*:|The\s+intended\s+use"
     ])
     if md.get("va_case_number"):
         out["va_case"] = find_evidence(pages, [
@@ -631,7 +660,7 @@ def compose_output_v27(md: Dict[str, str], flags: List[str]) -> str:
     else:
         lines.append("→ No material compliance flags detected by automated checks.")
     lines.append("")
-    lines.append("[SECTION 3] DETAILED FLAGS AND REFERENCES]")
+    lines.append("[SECTION 3] DETAILED FLAGS AND REFERENCES")
     if flags:
         for f in flags:
             lines.append(f"→ {f}")
@@ -648,7 +677,9 @@ def compose_output_v27(md: Dict[str, str], flags: List[str]) -> str:
     lines.append("")
     lines.append("[SECTION 5] ADDITIONAL NOTES")
     lines.append("→ Automated extraction powered by Azure Document Intelligence. Manual review recommended.")
-    lines.append("")
+    if SHOW_FOOTER:
+        lines.append("")
+        lines.append(f"— Engine v{ENGINE_VERSION}")
     return "\n".join(lines)
 
 def compose_output_analyst(md: Dict[str, str], text: str, pages: List[str], req_id: str) -> str:
@@ -664,9 +695,8 @@ def compose_output_analyst(md: Dict[str, str], text: str, pages: List[str], req_
     subj_addr_norm = _normalize_address(subj.get("subject_address") or "")
     address_ok = False
     if subj_addr_norm:
-        # Look for at least one mention elsewhere in the doc, not just header line
-        occurrences = len(re.findall(re.escape(subj.get("subject_address") or ""), text, re.IGNORECASE))
-        address_ok = occurrences >= 1  # relaxed due to OCR variance
+        occurrences = len(re.findall(re.escape(subj.get("subject_address")), text, re.IGNORECASE))
+        address_ok = occurrences >= 1  # relaxed
     passes += 1 if address_ok else 0
     if not address_ok:
         flags_cnt += 1
@@ -682,7 +712,7 @@ def compose_output_analyst(md: Dict[str, str], text: str, pages: List[str], req_
     hbu_ok = bool(re.search(r"Highest\s*&?\s*Best\s*Use.*?(present\s*use|as\s*improved|vacant)|Is\s+the\s+highest\s+and\s+best\s+use.*?\bYes\b", text, re.IGNORECASE))
     passes += 1 if hbu_ok else 0
 
-    # Garage/carport presence in at least one section
+    # Garage/carport presence
     garage_any = bool(re.search(r"\b(Garage|Carport)\b", text, re.IGNORECASE))
     passes += 1 if garage_any else 0
 
@@ -738,15 +768,13 @@ def compose_output_analyst(md: Dict[str, str], text: str, pages: List[str], req_
         lines.append(f"Form Type: {md['form_type']}")
     if md.get("rights_appraised"):
         lines.append(_with_evidence(f"Rights Appraised: {md['rights_appraised']}", pages_evidence.get("rights", "")))
-    client_line = md.get("client") or "N/A"
-    lines.append(f"Client / Lender: {client_line}")
+    lines.append(f"Client / Lender: {md.get('client') or 'N/A'}")
     if md.get("intended_use"):
         lines.append(_with_evidence(f"Intended Use: {md['intended_use']}", pages_evidence.get("intended_use", "")))
-    if md.get("is_va_loan") == "Yes":
-        if md.get("va_case_number"):
-            lines.append(_with_evidence(f"VA Case Number: {md['va_case_number']}", pages_evidence.get("va_case", "")))
-        else:
-            lines.append("VA indicators present; VA case number not found.")
+    if md.get("is_va_loan") == "Yes" and not md.get("va_case_number"):
+        lines.append("VA indicators present; VA case number not found.")
+    if md.get("va_case_number"):
+        lines.append(_with_evidence(f"VA Case Number: {md['va_case_number']}", pages_evidence.get("va_case", "")))
     lines.append("")
 
     # ------- Internal Consistency -------
@@ -790,7 +818,6 @@ def compose_output_analyst(md: Dict[str, str], text: str, pages: List[str], req_
     else:
         lines.append("ℹ️ Not enough data to confirm GLA bracketing (comp GLA range missing)")
 
-    # quick proxies for other bracketing dimensions
     for label in ["site", "age", "condition", "quality"]:
         present = bool(re.search(label, text, re.IGNORECASE))
         lines.append(f"✔ Subject bracketed for {label}" if present else f"ℹ️ {label.capitalize()} bracketing not confirmed")
@@ -803,7 +830,7 @@ def compose_output_analyst(md: Dict[str, str], text: str, pages: List[str], req_
             try:
                 if float(g) >= 25.0:
                     risky.append((i, g))
-            except Exception:
+            except:
                 pass
     if risky:
         cnum, gv = risky[0]
@@ -840,7 +867,13 @@ def compose_output_analyst(md: Dict[str, str], text: str, pages: List[str], req_
     lines.append(f"Adjusted Value Range: {comp_summary['adj_range'] or 'N/A'}")
     lines.append(f"Sale Date Range: {comp_summary['sale_date_range'] or 'N/A'}")
     lines.append("")
-    lines.append(f"— Engine v{ENGINE_VERSION} • req:{req_id}")
+
+    # Disclaimer + footer
+    lines.append(DISCLAIMER_LINE)
+    if SHOW_FOOTER:
+        lines.append("")
+        lines.append(f"— Engine v{ENGINE_VERSION} • req:{req_id}")
+
     return "\n".join(lines)
 
 # ----------------------------
