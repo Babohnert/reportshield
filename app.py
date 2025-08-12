@@ -57,7 +57,7 @@ if CORS_ORIGINS:
 
 # Versions (kept in sync with engine)
 RULES_VERSION = "v2.9"
-SCHEMATIC_VERSION = "v6.6"
+SCHEMATIC_VERSION = "v6.6"  # keep in sync with engine schematic
 
 # Simple in-memory rate limiter (best-effort; reset every minute)
 RATE_LIMIT_RPM = int(os.getenv("RATE_LIMIT_RPM", "60"))
@@ -85,7 +85,7 @@ def _short_fail(msg: str, status: int = 500) -> PlainTextResponse:
 # -----------------------------
 @app.get("/")
 async def root() -> JSONResponse:
-    return JSONResponse({"status": "ok", "service": "Compliance Audit API", "schematic": SCHEMATIC_VERSION})
+    return JSONResponse({"status": "ok", "service": "Compliance Audit API", "schematic": SCHEMATIC_VERSION, "routes": ["/audit","/audit_url","/health","/ready","/version"]})
 
 
 @app.get("/health")
