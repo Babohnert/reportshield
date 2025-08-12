@@ -1,8 +1,8 @@
-Flask==2.3.3
-Flask-Cors==4.0.0
-gunicorn==22.0.0
+fastapi==0.110.0
+uvicorn==0.27.1
+gunicorn==21.2.0
+python-multipart==0.0.9
+pypdf==4.2.0
+azure-ai-formrecognizer==3.3.0
 python-dotenv==1.0.1
-requests==2.32.3
-azure-ai-formrecognizer==3.3.2
-azure-core==1.30.2
-PyMuPDF==1.24.9
+starlette==0.36.3
