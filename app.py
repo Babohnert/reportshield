@@ -1,23 +1,23 @@
+# app.py — FastAPI for ReportShield (Render-ready)
 import os
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import PlainTextResponse
-from engine import run_audit  # v6.6 engine
+from engine import run_audit  # your v6.6 engine
 
 MAX_MB = int(os.getenv("MAX_MB", "25"))
 
 app = FastAPI()
 
-# Allow your live Wix + site
-allowed_origins = [
-    "https://reportshield.ai",
-    "https://www.reportshield.ai",   # harmless even if unused
-    "https://*.wixsite.com",         # Wix preview
-    "https://*.wixmp.com"            # Wix static CDN
-]
+# CORS: explicit sites + regex for Wix subdomains/CDNs
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
+    allow_origins=[
+        "https://reportshield.ai",
+        "https://www.reportshield.ai",
+        # If you have a custom Wix domain (e.g., https://yourbrand.com), add it here too.
+    ],
+    allow_origin_regex=r"^https://([a-zA-Z0-9-]+\.)*(wixsite|editorx)\.com$|^https://([a-zA-Z0-9-]+\.)*(wixstatic|wixmp)\.com$",
     allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
     allow_headers=["*"],
 )
@@ -41,6 +41,13 @@ async def version():
 @app.get("/limits", response_class=PlainTextResponse)
 async def limits():
     return f"MAX_MB={MAX_MB}"
+
+# Optional: simple echo for debugging multipart from Wix
+@app.post("/echo", response_class=PlainTextResponse)
+async def echo(file: UploadFile = File(None)):
+    name = getattr(file, "filename", None) if file else None
+    size = len(await file.read()) if file else 0
+    return f"received file={bool(file)} name={name} size={size}"
 
 @app.post("/audit", response_class=PlainTextResponse)
 async def audit(file: UploadFile = File(...)):
