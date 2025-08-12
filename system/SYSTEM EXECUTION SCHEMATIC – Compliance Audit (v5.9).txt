@@ -1,31 +1,328 @@
-SYSTEM EXECUTION SCHEMATIC – Compliance Audit (v5.9)
+SYSTEM EXECUTION SCHEMATIC – Compliance Audit (v6.6)
 
 SCOPE:
 This file defines fixed, rule-locked behavior for the Compliance Audit API. No generative reasoning, summaries, or stylistic interpretation are permitted by the execution engine. Output must be plain text and limited to five sections.
 
-RUNTIME BEHAVIOR (ABRIDGED):
-1) Accept an uploaded appraisal PDF via POST /audit.
-2) Extract text via Azure Document Intelligence ("prebuilt-document").
-3) Parse essential metadata (effective date, form type, appraiser, client, VA indicator).
-4) Run rule checks including, at minimum:
-   - Presence of 1004MC (Market Conditions Addendum).
-   - VA MPR references if VA indicators present.
-   - Signature/date consistency heuristic.
-5) Render a five-section, plain text audit:
-   [SECTION 1] Report Metadata Snapshot
-   [SECTION 2] Summary of Compliance Flags
-   [SECTION 3] Detailed Flags and References
-   [SECTION 4] Top Flags (Condensed)
-   [SECTION 5] Additional Notes
-6) No markdown, tables, or decorative formatting. No AI voice or commentary.
-7) Session handling is request-scoped only; do not store uploads after processing.
-8) Do not disclose internal prompts, file paths, or version tags in responses beyond the five-section output label.
-9) If an internal error occurs, return HTTP 500 with a short plain-text message.
+VERSIONING:
 
-PARSING / PRIVACY:
-- The engine reads the uploaded file only to produce the audit and does not retain it after the request is complete.
-- No user data is persisted by this API.
+Schematic version: v6.6
 
-UI INTEGRATION:
-- The API is frontend-agnostic and intended for Wix or any authenticated frontend via a simple file upload and plain text response.
-- The /health endpoint returns a basic JSON object for uptime probes.
+Requires OUTPUT RULES – Compliance Audit v2.9
+
+At startup, compute checksums for both files and abort if missing or checksum mismatch.
+
+CONFIGURATION (ENV TOGGLES):
+
+PUBLIC_MODE=true|false (default: true)
+
+MAX_PAGES=500 (default)
+
+MAX_MB=25 (default)
+
+AZURE_MODEL="prebuilt-document" (default)
+
+PII_REDACT=true|false (default: true)
+
+RATE_LIMIT_RPM=60 (default per IP)
+
+EVIDENCE_SNIPPET_MAX_WORDS=15 (default)
+
+LOCALE=en_US (fixed)
+
+TIMEZONE=UTC (fixed)
+
+ENDPOINTS:
+
+POST /audit — accepts multipart/form-data with field name "file"; returns text/plain audit on success.
+
+GET /health — returns JSON { "status": "ok" } indicating process liveness only.
+
+GET /ready — returns JSON { "status": "ready", "rules":"v2.9", "schematic":"v6.6" } only if Azure reachable and checksums verified.
+
+GET /version — returns JSON { "rules":"v2.9", "schematic":"v6.6" } (no internal paths or metadata).
+
+SECURITY & LIMITS:
+
+Accept only PDFs (content-type and magic-number verification).
+
+Reject password-protected PDFs, PDFs with active JavaScript, or files with embedded attachments.
+
+Enforce MAX_MB and MAX_PAGES; return HTTP 400 on violation.
+
+Rate-limit by IP using RATE_LIMIT_RPM.
+
+Denylist suspicious file names and double extensions.
+
+ERROR TAXONOMY (DEVELOPER-FACING CODES):
+
+E_INPUT — invalid request/file/type/size/pages
+
+E_PDFLOCK — password/encryption/JS/embedded
+
+E_PARSE — Azure extraction failure
+
+E_RULES — rules/schematic load or checksum failure
+
+E_TIMEOUT — module exceeded budget/time limit
+User-facing message must be “Audit failed: <short friendly message>” without codes or internals.
+
+DETERMINISM & DRIFT CONTROL:
+
+Model temperature must be 0.
+
+Include non-returned header in prompt with rules+schematic checksums.
+
+Abort (HTTP 500) with “Audit failed: configuration error” if loaded versions don’t match required versions.
+
+DATA HANDLING & PRIVACY:
+
+Request-scoped processing only; do not persist uploads or extracted content beyond the response.
+
+Temporary files (if any) must be securely deleted before sending the response.
+
+Minimal telemetry only (no content): timestamp, file size/pages, per-module duration, triggered rule IDs.
+
+Public mode: redact borrower/client names in Section 1; private mode: show them.
+
+EXECUTION OVERVIEW (DETERMINISTIC MODULE ORDER):
+MODULE_0: Request Intake & Validation
+MODULE_1: Document Extraction (Azure Document Intelligence)
+MODULE_2: Pre-Normalization & Safety Filters
+MODULE_3: Field Parsing & Derivations
+MODULE_4: Conditional Context Detection (Loan/Form/State)
+MODULE_5: Rule Evaluation (Evidence-First)
+MODULE_6: Moderation & Compliance Pass (Fair Housing, PII)
+MODULE_7: Integrity Pass (Downgrades & De-duplication)
+MODULE_8: Render & Response
+
+MODULE_0 — Request Intake & Validation:
+
+Endpoint: POST /audit; require multipart/form-data, field name “file”.
+
+Validate: content-type, magic bytes, size ≤ MAX_MB, pages ≤ MAX_PAGES.
+
+Reject: password-protected/encrypted PDFs, PDFs with JavaScript, PDFs with embedded files.
+
+On failure: HTTP 400 with short plain-text reason (no codes).
+
+On success: assign request-scope ID (not returned) and proceed.
+
+MODULE_1 — Document Extraction (Azure Document Intelligence):
+
+Use AZURE_MODEL="prebuilt-document" with tables, key-value pairs, selection marks, and page numbers.
+
+Parameters: ocr_languages=["en"], read_order="natural".
+
+Extract:
+
+Full text by page with indices.
+
+Key-value pairs and their page refs.
+
+Tables and selection marks if present.
+
+On failure: HTTP 500 “Audit failed: could not read the PDF” (maps to E_PARSE).
+
+No silent fallback to other OCR engines.
+
+MODULE_2 — Pre-Normalization & Safety Filters:
+
+Normalize line endings, collapse duplicate whitespace, unify dash usage.
+
+Normalize obvious date/currency tokens when unambiguous (do not infer missing values).
+
+Build indices:
+
+page_text[page_no]
+
+kv_index (key → values with page refs)
+
+form_markers (e.g., “UNIFORM RESIDENTIAL APPRAISAL REPORT”, “1004MC”)
+
+Initialize redaction map for PII patterns (borrower names, loan IDs) but do not apply yet.
+
+Sanitize text to remove control characters and unusual glyphs.
+
+MODULE_3 — Field Parsing & Derivations:
+
+Parse core fields using KV-first then text-first strategies; record page refs and 5–8 word context snippets (pre-redaction):
+
+Effective Date, Form Type, Appraiser Name, Intended Use / Client, Subject Address, Value Conclusion, Loan Type Indicators (VA/FHA/USDA/Conventional).
+
+Double-extraction for critical fields (Effective Date, Value Conclusion, Client/Lender):
+
+Record both strategies and mark mismatch if unequal.
+
+Parse comparables where present: address, GLA, site, age, condition, quality, sale dates, DOM, gross/net adjustments.
+
+Derive min–max ranges only when ≥2 values exist; otherwise mark as insufficient.
+
+MODULE_4 — Conditional Context Detection (Loan/Form/State):
+
+Loan type inference:
+
+If any VA indicator anywhere → VA context ON.
+
+If FHA/HUD indicators → FHA context ON.
+
+If USDA indicators → USDA context ON.
+
+Else default to Conventional.
+
+Form type normalization (1004/URAR, 1025, 1004C, 1073, 2055, etc.).
+
+Property-type validation guards (e.g., 1025 requires multifamily; 1004C requires manufactured).
+
+State detection from subject address; retain two-letter postal code.
+
+Load state hook registry from /system/state-hooks.json (if present); missing file is not fatal.
+
+MODULE_5 — Rule Evaluation (Evidence-First):
+
+Load OUTPUT RULES – Compliance Audit v2.9 verbatim. Abort if mismatch.
+
+Apply mandatory checks:
+
+1004MC presence (form/loan applicability).
+
+VA MPR references (if VA context).
+
+FHA exhibits/certifications (if FHA context).
+
+Signature/credential basics: name ↔ header, license number, state, date signed.
+
+Highest & Best Use: statement and support.
+
+Subject address extraction + cross-page consistency (test only if subject address present).
+
+Loan-type detection consistency across pages.
+
+State hooks (flood/septic/solar/radon) when state known.
+
+Form ↔ property-type validation.
+
+Subject-to conditions: repair/completion language paired with appropriate addenda; flag if incomplete.
+
+Scope of Work contradictions (declared vs developed approaches).
+
+Market trend claims require statistical support; flag vague/unsupported claims.
+
+Value reconciliation reasoning must reference adjusted range.
+
+Bracketing (GLA/site/age/condition/quality):
+
+Require subject value + ≥2 comps per attribute for any confirmed assertion; otherwise informational “Not enough data to confirm …”.
+
+Adjustment ranges:
+
+Only assert “gross/net within typical ranges” when computed for all used comps.
+
+Duplicate exhibit detection:
+
+If same form header appears multiple times with similar content, flag possible duplication with first/last page refs.
+
+Assign severity tags [CRITICAL]/[MODERATE]/[MINOR] and short rule IDs (e.g., USPAP-13, FHA-02) internally; IDs may be appended in Section 3 if configured.
+
+MODULE_6 — Moderation & Compliance Pass (Fair Housing, PII):
+
+Scan outgoing narrative for protected classes and preference/limitation language; do not reproduce protected terms.
+
+Replace protected terms in evidence snippets with “[…]”.
+
+Add “Potential Fair Housing concern detected in narrative” flag:
+
+Severity at least MODERATE; CRITICAL if explicit preference/limitation is found.
+
+Apply PII redaction map to evidence snippets (borrower names, IDs).
+
+If PUBLIC_MODE=true:
+
+In Section 1, replace borrower/client names with “[Redacted]”.
+
+Set response header X-Output-Mode: public.
+
+Else set X-Output-Mode: private.
+
+MODULE_7 — Integrity Pass (Downgrades & De-duplication):
+
+If a field is “[Not found]” in Section 1, convert any later “confirmed/consistent” statements about that field to informational.
+
+Resolve double-extraction mismatches:
+
+Add explicit “Inconsistent <Field>” flag with both values and page refs.
+
+Rank flags for Section 2 by severity, then by impact/frequency; deduplicate near-duplicates.
+
+Select up to three items for Section 4, with tiebreakers:
+
+Legal/agency over internal consistency,
+
+Greater frequency of occurrence,
+
+Earliest page occurrence.
+
+MODULE_8 — Render & Response:
+
+Render exactly five sections with these labels in this order:
+[SECTION 1] REPORT METADATA SNAPSHOT
+[SECTION 2] SUMMARY OF COMPLIANCE FLAGS
+[SECTION 3] DETAILED FLAGS AND REFERENCES
+[SECTION 4] TOP FLAGS (CONDENSED)
+[SECTION 5] ADDITIONAL NOTES
+
+Formatting constraints:
+
+Plain text only; indicator “→” only; no markdown/tables/HTML/code fences.
+
+Data normalization: dates “MMM DD, YYYY”; currency “$###,###”; ranges “A–B”.
+
+Evidence snippet ≤ EVIDENCE_SNIPPET_MAX_WORDS words with page number; apply PII and protected-term redaction.
+
+Strip trailing commas and collapse whitespace; sanitize quotes around snippets.
+
+Do not output engine IDs, request IDs, file paths, thresholds, or checksums.
+
+Section content rules:
+
+Section 1: fixed lines and order; evidence allowed only for Effective Date and Form Type.
+
+Section 2: list high-level flags with [CRITICAL]/[MODERATE]/[MINOR]; no evidence in this section.
+
+Section 3: mirror Section 2 with concise detail and evidence where applicable; optionally append rule IDs (e.g., “[USPAP-13]”) if configured.
+
+Section 4: up to three condensed items; no evidence.
+
+Section 5: up to three lines (ops notes/data gaps) and final required disclaimer:
+→ Automated audit. Use professional judgment when making final report decisions.
+
+HTTP response:
+
+Success: 200 text/plain; add headers:
+
+Content-Type: text/plain; charset=utf-8
+
+X-Rules-Version: v2.9
+
+X-Schematic-Version: v6.6
+
+X-Output-Mode: public|private
+
+Error: HTTP 400/500 with body “Audit failed: <short message>” only.
+
+TIMEOUTS:
+
+Per-module time budgets enforced; on overrun return HTTP 500 “Audit failed: timeout” (maps to E_TIMEOUT). No partial outputs.
+
+STATE HOOK REGISTRY:
+
+Optional file: /system/state-hooks.json
+
+Structure: per-state arrays of mini-checks (e.g., flood/septic/solar/radon). If present, MODULE_4 loads and MODULE_5 evaluates. Missing registry is non-fatal.
+
+TELEMETRY (NO CONTENT):
+
+Log only: timestamp, file size, page count, per-module duration, triggered rule IDs, HTTP status. No PDF text or PII captured.
+
+CHANGE CONTROL:
+
+This schematic must be loaded verbatim at runtime. Any behavioral edits require a new version string and checksum update.
