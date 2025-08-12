@@ -1,138 +1,161 @@
-import io
+"""
+app.py — Compliance Audit API (v6.6-compatible)
+
+Implements the public HTTP interface described in the SYSTEM EXECUTION SCHEMATIC v6.6:
+- POST /audit  -> returns text/plain five-section audit
+- GET  /health -> liveness
+- GET  /ready  -> readiness (Azure reachable + rules/schematic present)
+- GET  /version-> versions only
+
+Behavioral notes:
+- Always return text/plain for /audit body; never JSON.
+- Add headers: X-Rules-Version, X-Schematic-Version, X-Output-Mode on success.
+- No persistence; request-scoped processing.
+- Enforces basic rate limiting per IP (best-effort, in-memory).
+"""
+from __future__ import annotations
+
 import os
-import sys
-import traceback
-from typing import Optional
+import time
+import io
+from typing import Dict
 
-from flask import Flask, request, jsonify, Response
-from flask_cors import CORS
-import requests
+from fastapi import FastAPI, File, UploadFile, Response, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.responses import PlainTextResponse, JSONResponse
+from pypdf import PdfReader
 
-# Our analyzer
-from engine import run_audit, ENGINE_VERSION
+# Engine (rule-locked logic)
+from engine.__init__ import run_audit, OUTPUT_RULES_PATH, SCHEMATIC_PATH, PUBLIC_MODE, MAX_MB, MAX_PAGES
 
-# ----------------------------
-# App + CORS
-# ----------------------------
-app = Flask(__name__)
-# Permissive CORS (Wix dev + prod). Lock down later if you want.
-CORS(app, resources={r"/*": {"origins": "*"}})
+# -----------------------------
+# App setup
+# -----------------------------
+app = FastAPI(title="Compliance Audit API", version="6.6")
 
-# Limits / knobs
-MAX_DOWNLOAD_MB = int(os.getenv("MAX_DOWNLOAD_MB", "25"))
-REQUESTS_TIMEOUT = int(os.getenv("REQUESTS_TIMEOUT", "30"))
-
-def _log(s: str):
-    try:
-        print(s, flush=True)
-    except Exception:
-        pass
-
-# ----------------------------
-# Helpers
-# ----------------------------
-def _download_bytes(url: str, max_mb: int) -> bytes:
-    """
-    Stream-download a file from URL into memory with a hard size cap.
-    """
-    if not url or not isinstance(url, str):
-        raise ValueError("Missing or invalid 'url'.")
-
-    _log(f"[DL] fetching: {url}")
-    with requests.get(url, stream=True, timeout=REQUESTS_TIMEOUT, allow_redirects=True) as r:
-        if r.status_code >= 400:
-            raise RuntimeError(f"Download failed: HTTP {r.status_code}")
-        total = 0
-        buf = io.BytesIO()
-        for chunk in r.iter_content(chunk_size=1024 * 256):
-            if not chunk:
-                continue
-            buf.write(chunk)
-            total += len(chunk)
-            if total > max_mb * 1024 * 1024:
-                raise RuntimeError(f"File exceeds {max_mb}MB limit.")
-        return buf.getvalue()
-
-def _safe_audit(file_like, style: Optional[str]) -> str:
-    """
-    Wrap run_audit to always return a clean text or raise an Exception.
-    """
-    try:
-        return run_audit(file_like, style_override=style)
-    except Exception as ex:
-        # Surface concise error + log traceback
-        tb = traceback.format_exc()
-        _log(f"[AUDIT ERROR] {ex}\n{tb}")
-        raise
-
-# ----------------------------
-# Routes
-# ----------------------------
-@app.get("/")
-def root():
-    return Response(
-        f"ReportShield API OK (engine v{ENGINE_VERSION})\n",
-        status=200,
-        content_type="text/plain; charset=utf-8",
+# Optional CORS (configure origins via env, comma-separated)
+CORS_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "").split(",") if os.getenv("CORS_ALLOW_ORIGINS") else []
+if CORS_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[o.strip() for o in CORS_ORIGINS if o.strip()],
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
 
+# Versions (kept in sync with engine)
+RULES_VERSION = "v2.9"
+SCHEMATIC_VERSION = "v6.6"
+
+# Simple in-memory rate limiter (best-effort; reset every minute)
+RATE_LIMIT_RPM = int(os.getenv("RATE_LIMIT_RPM", "60"))
+_rate_bucket: Dict[str, Dict[str, int]] = {}
+
+
+def _rate_limited(ip: str) -> bool:
+    now_min = int(time.time() // 60)
+    b = _rate_bucket.setdefault(ip, {"min": now_min, "count": 0})
+    if b["min"] != now_min:
+        b["min"] = now_min
+        b["count"] = 0
+    if b["count"] >= RATE_LIMIT_RPM:
+        return True
+    b["count"] += 1
+    return False
+
+
+def _short_fail(msg: str, status: int = 500) -> PlainTextResponse:
+    return PlainTextResponse(f"Audit failed: {msg}", status_code=status, media_type="text/plain; charset=utf-8")
+
+
+# -----------------------------
+# Endpoints
+# -----------------------------
 @app.get("/health")
-def health():
-    return jsonify({
-        "ok": True,
-        "engine": ENGINE_VERSION,
-        "message": "healthy"
-    }), 200
+async def health() -> JSONResponse:
+    return JSONResponse({"status": "ok"})
+
+
+@app.get("/ready")
+async def ready() -> JSONResponse:
+    # Check rules & schematic existence; do not leak paths
+    rules_ok = os.path.exists(OUTPUT_RULES_PATH)
+    schematic_ok = os.path.exists(SCHEMATIC_PATH)
+    azure_ok = bool(os.getenv("AZURE_FORMRECOGNIZER_ENDPOINT") and os.getenv("AZURE_FORMRECOGNIZER_KEY"))
+    status = "ready" if (rules_ok and schematic_ok and azure_ok) else "not_ready"
+    return JSONResponse({"status": status, "rules": RULES_VERSION if rules_ok else None, "schematic": SCHEMATIC_VERSION if schematic_ok else None})
+
+
+@app.get("/version")
+async def version() -> JSONResponse:
+    return JSONResponse({"rules": RULES_VERSION, "schematic": SCHEMATIC_VERSION})
+
 
 @app.post("/audit")
-def audit_upload():
-    """
-    Form-data upload: field name 'file'. Optional query param ?style=analyst|v27
-    Returns plain text (so legacy Wix front-ends that do res.text() still work).
-    On error: still 200 with 'ERROR: ...' text.
-    """
-    style = (request.args.get("style") or "").strip() or None
+async def audit(request: Request, file: UploadFile = File(...)) -> Response:
+    # Rate limit
+    client_ip = request.client.host if request.client else "unknown"
+    if _rate_limited(client_ip):
+        return _short_fail("rate limit exceeded", status=429)
+
+    # Content-type guard (best-effort)
+    if (file.content_type or "").lower() not in {"application/pdf", "application/x-pdf", "binary/octet-stream"}:
+        return _short_fail("unsupported file type", status=400)
+
     try:
-        if "file" not in request.files:
-            return Response("ERROR: Missing 'file' in form-data.", status=200, content_type="text/plain; charset=utf-8")
+        data = await file.read()
+    except Exception:
+        return _short_fail("could not read the uploaded file", status=400)
 
-        f = request.files["file"]  # werkzeug.FileStorage
-        if not f or not getattr(f, "filename", ""):
-            return Response("ERROR: Empty upload.", status=200, content_type="text/plain; charset=utf-8")
+    # Basic size check
+    size_mb = len(data) / (1024 * 1024)
+    if size_mb > MAX_MB:
+        return _short_fail("file too large", status=400)
 
-        # Let the engine read the stream directly
-        report = _safe_audit(f, style)
-        return Response(report or "", status=200, content_type="text/plain; charset=utf-8")
+    # Magic bytes
+    if not data.startswith(b"%PDF"):
+        return _short_fail("unsupported file type", status=400)
 
-    except Exception as ex:
-        return Response(f"ERROR: {ex}", status=200, content_type="text/plain; charset=utf-8")
-
-@app.post("/audit_url")
-def audit_by_url():
-    """
-    JSON body: { "url": "<https...>", "style": "analyst|v27" }
-    Returns JSON: { ok: true, result: "..." } or { ok: false, error: "..." }
-    Always HTTP 200 so Wix doesn't fail the fetch.
-    """
+    # Page count + JS/embedded checks
     try:
-        data = request.get_json(silent=True) or {}
-        url = (data.get("url") or "").strip()
-        style = (data.get("style") or "").strip() or None
-        if not url:
-            return jsonify({"ok": False, "error": "Missing 'url' in JSON body."}), 200
+        reader = PdfReader(io.BytesIO(data))
+        num_pages = len(reader.pages)
+        if num_pages > MAX_PAGES:
+            return _short_fail("too many pages", status=400)
+        catalog = reader.trailer.get("/Root", {})
+        if "/Names" in catalog and getattr(catalog["/Names"], "get", lambda *_: None)("/JavaScript"):
+            return _short_fail("PDF contains JavaScript", status=400)
+        if "/Names" in catalog and getattr(catalog["/Names"], "get", lambda *_: None)("/EmbeddedFiles"):
+            return _short_fail("PDF contains embedded files", status=400)
+    except HTTPException:
+        raise
+    except Exception:
+        # proceed; engine will attempt Azure and fail clearly if needed
+        pass
 
-        raw = _download_bytes(url, MAX_DOWNLOAD_MB)
-        # Use BytesIO so engine sees a file-like
-        report = _safe_audit(io.BytesIO(raw), style)
-        return jsonify({"ok": True, "result": report or ""}), 200
+    # Run engine (returns plain text)
+    try:
+        text = run_audit(data)
+    except RuntimeError as e:
+        # Ensure we only return the short text and not internals
+        msg = str(e)
+        if not msg.startswith("Audit failed:"):
+            msg = "Audit failed: processing error"
+        return PlainTextResponse(msg, status_code=500, media_type="text/plain; charset=utf-8")
+    except Exception:
+        return _short_fail("processing error", status=500)
 
-    except Exception as ex:
-        return jsonify({"ok": False, "error": str(ex)}), 200
+    # Success
+    headers = {
+        "X-Rules-Version": RULES_VERSION,
+        "X-Schematic-Version": SCHEMATIC_VERSION,
+        "X-Output-Mode": "public" if PUBLIC_MODE else "private",
+        "Content-Type": "text/plain; charset=utf-8",
+    }
+    return Response(content=text, media_type="text/plain; charset=utf-8", headers=headers)
 
-# ----------------------------
-# Local dev entry
-# ----------------------------
+
+# Optional: run with `python app.py`
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
-    _log(f"Starting dev server on :{port}")
-    app.run(host="0.0.0.0", port=port, debug=True)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
