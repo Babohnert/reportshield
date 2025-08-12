@@ -1,11 +1,13 @@
 # app.py — FastAPI for ReportShield (Render-ready)
-import os
+import os, re, requests
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import PlainTextResponse
+from pydantic import BaseModel, HttpUrl
 from engine import run_audit  # v6.6 engine entrypoint
 
 MAX_MB = int(os.getenv("MAX_MB", "25"))
+MAX_DOWNLOAD_MB = MAX_MB  # keep same cap for remote fetch
 
 app = FastAPI(title="ReportShield API")
 
@@ -15,8 +17,7 @@ app.add_middleware(
     allow_origins=[
         "https://reportshield.ai",
         "https://www.reportshield.ai",
-        # If you have a custom live site domain, add it here too.
-        # e.g., "https://yourbrand.com",
+        # add your live site domain here if you have one
     ],
     allow_origin_regex=(
         r"^https://([a-zA-Z0-9-]+\.)*(wixsite|editorx)\.com$"
@@ -48,7 +49,7 @@ async def version():
 async def limits():
     return f"MAX_MB={MAX_MB}"
 
-# Optional: debug endpoint to confirm multipart from Wix
+# Optional: debug
 @app.post("/echo", response_class=PlainTextResponse)
 async def echo(file: UploadFile = File(None)):
     if not file:
@@ -64,10 +65,50 @@ async def audit(file: UploadFile = File(...)):
             raise HTTPException(status_code=400, detail="Please upload a PDF.")
         if len(data) > MAX_MB * 1024 * 1024:
             raise HTTPException(status_code=413, detail=f"File too large (>{MAX_MB} MB).")
-        result = run_audit(data)  # returns plain text with emojis
-        return result
+        return run_audit(data)
     except HTTPException:
         raise
     except Exception as e:
-        # Keep the error human-readable; the engine also formats errors if it raises
+        raise HTTPException(status_code=500, detail=f"Audit failed: {e}")
+
+# ---- New: audit-by-url (server fetches Wix media) ----
+ALLOWED_MEDIA = re.compile(
+    r"^https://static\.wixstatic\.com/.*|^https://video\.wixstatic\.com/.*|^https://files\.usr\.files\.wixcdn\.net/.*",
+    re.IGNORECASE,
+)
+
+class UrlIn(BaseModel):
+    url: HttpUrl
+    name: str | None = None
+
+@app.post("/audit-by-url", response_class=PlainTextResponse)
+async def audit_by_url(payload: UrlIn):
+    url = str(payload.url)
+    if not ALLOWED_MEDIA.match(url):
+        raise HTTPException(status_code=400, detail="URL not allowed")
+
+    try:
+        with requests.get(url, stream=True, timeout=30) as r:
+            r.raise_for_status()
+            # enforce size cap while streaming
+            chunks = []
+            total = 0
+            for chunk in r.iter_content(chunk_size=1024 * 64):
+                if not chunk:
+                    continue
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > MAX_DOWNLOAD_MB * 1024 * 1024:
+                    raise HTTPException(status_code=413, detail=f"Remote file too large (>{MAX_DOWNLOAD_MB} MB).")
+            data = b"".join(chunks)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Download failed: {e}")
+
+    if not data.startswith(b"%PDF"):
+        raise HTTPException(status_code=400, detail="Remote file is not a PDF.")
+    try:
+        return run_audit(data)
+    except Exception as e:
         raise HTTPException(status_code=500, detail=f"Audit failed: {e}")
