@@ -1,5 +1,5 @@
 """
-app.py — Compliance Audit API (v6.6-compatible)
+app.py — Compliance Audit API (v6.6-compatible, minimal)
 
 Implements the public HTTP interface described in the SYSTEM EXECUTION SCHEMATIC v6.6:
 - POST /audit  -> returns text/plain five-section audit
